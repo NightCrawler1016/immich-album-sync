@@ -13,29 +13,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tar \
     && rm -rf /var/lib/apt/lists/*
 
-# Install immich-go binary
-# TARGETARCH is automatically set by Docker Buildx (amd64 / arm64).
-# Falls back to amd64 for plain `docker build` without --platform.
-ARG TARGETARCH=amd64
+# Install immich-go binary.
+# Use uname -m to detect the real running architecture — reliable under
+# both native builds and QEMU cross-compilation (where ARG TARGETARCH
+# can silently stay at its default value instead of being overridden).
 RUN set -ex && \
-    case "${TARGETARCH}" in \
-        amd64)  BIN_ARCH="x86_64" ;; \
-        arm64)  BIN_ARCH="arm64" ;; \
-        *)      BIN_ARCH="x86_64" ;; \
+    ARCH=$(uname -m) && \
+    case "$ARCH" in \
+        x86_64)  BIN_ARCH="x86_64" ;; \
+        aarch64) BIN_ARCH="arm64" ;; \
+        *)       BIN_ARCH="x86_64" ;; \
     esac && \
-    # Fetch the latest release tag from GitHub API (e.g. "v0.23.1")
     LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/simulot/immich-go/releases/latest" \
         | grep '"tag_name"' | head -1 | cut -d'"' -f4) && \
-    echo "Installing immich-go ${LATEST_TAG} for ${BIN_ARCH}" && \
+    echo "Installing immich-go ${LATEST_TAG} for arch=${ARCH} (${BIN_ARCH})" && \
     curl -fsSL "https://github.com/simulot/immich-go/releases/download/${LATEST_TAG}/immich-go_Linux_${BIN_ARCH}.tar.gz" \
         -o /tmp/immich-go.tar.gz && \
     mkdir -p /tmp/immich-go-extract && \
     tar -xzf /tmp/immich-go.tar.gz -C /tmp/immich-go-extract && \
-    # Find the binary regardless of directory structure inside the tar
     find /tmp/immich-go-extract -name "immich-go" -type f | head -1 | \
         xargs -I{} install -m 755 {} /usr/local/bin/immich-go && \
     rm -rf /tmp/immich-go.tar.gz /tmp/immich-go-extract && \
-    # Verify — this will fail the build if the binary is missing
     immich-go --version
 
 WORKDIR /app
