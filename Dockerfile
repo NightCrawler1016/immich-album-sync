@@ -37,12 +37,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 
 # Create default appdata directories (will be overridden by volume mount)
+# Note: running as root for Unraid compatibility — Unraid manages its own
+# security model and mounts host directories as root-owned.
 RUN mkdir -p /app/appdata/cache /app/appdata/logs
-
-# Non-root user for security
-RUN useradd -r -u 1000 -g root syncuser && \
-    chown -R syncuser:root /app
-USER syncuser
 
 EXPOSE 8080
 
