@@ -32,7 +32,11 @@
   </Overview>
   <Category>Backup: MediaApp:Photos Status:Stable</Category>
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/NightCrawler1016/immich-album-sync/main/immich-album-sync.xml</TemplateURL>
+  <!-- TemplateURL intentionally omitted — prevents Unraid from re-fetching
+       defaults from GitHub and overwriting user-configured settings.
+       To update the template manually, re-download from:
+       https://raw.githubusercontent.com/NightCrawler1016/immich-album-sync/main/immich-album-sync.xml -->
+  <TemplateURL></TemplateURL>
   <Icon>https://raw.githubusercontent.com/NightCrawler1016/immich-album-sync/main/icon.png</Icon>
   <ExtraParams>--restart unless-stopped</ExtraParams>
   <Description>
@@ -79,13 +83,13 @@
   <Config
     Name="Secret Key"
     Target="SECRET_KEY"
-    Default=""
+    Default="change-me-please-use-a-long-random-string-here"
     Mode=""
-    Description="REQUIRED: A long random string used to sign session cookies. Generate one at: https://1password.com/password-generator/ or use any random 32+ character string. Changing this will log out all active sessions."
+    Description="REQUIRED: Change this to a long random string used to sign session cookies. Using the default value is insecure. Generate one at: https://1password.com/password-generator/ (32+ characters). Changing this will log out all active sessions."
     Type="Variable"
     Display="always"
     Required="true"
-    Mask="true"></Config>
+    Mask="true">change-me-please-use-a-long-random-string-here</Config>
 
   <Config
     Name="Timezone"
