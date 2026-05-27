@@ -1,0 +1,321 @@
+{% extends "base.html" %}
+{% block title %}{% if job %}Edit{% else %}New{% endif %} Sync Job — Immich Album Sync{% endblock %}
+
+{% block content %}
+<div class="p-4 sm:p-6 lg:p-8 max-w-3xl mx-auto">
+
+  <!-- Header -->
+  <div class="flex items-center gap-3 mb-6">
+    <a href="/jobs" class="p-2 rounded-lg text-gray-400 hover:bg-gray-800 hover:text-white">
+      <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    </a>
+    <div>
+      <h1 class="text-xl font-bold text-white">{% if job %}Edit Job{% else %}New Sync Job{% endif %}</h1>
+      <p class="text-sm text-gray-400 mt-0.5">{% if job %}Update sync configuration{% else %}Configure a new album sync rule{% endif %}</p>
+    </div>
+  </div>
+
+  {% if error %}
+  <div class="mb-5 px-4 py-3 rounded-lg bg-red-900/50 border border-red-700 text-red-300 text-sm">{{ error }}</div>
+  {% endif %}
+
+  <form method="post" action="{% if job %}/jobs/{{ job.id }}/edit{% else %}/jobs/new{% endif %}" class="space-y-6">
+
+    <!-- Job name -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-sm font-semibold text-gray-200 mb-4">Job Details</h2>
+      <div>
+        <label for="name" class="block text-sm font-medium text-gray-300 mb-1.5">Job Name</label>
+        <input id="name" name="name" type="text" required
+               value="{{ job.name if job else '' }}"
+               placeholder="e.g. Family Shared Sync"
+               class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"/>
+        <p class="text-xs text-gray-500 mt-1">A friendly name to identify this sync rule.</p>
+      </div>
+    </div>
+
+    <!-- Source server -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-sm font-semibold text-gray-200">
+          <span class="inline-flex items-center gap-1.5">
+            <span class="w-2 h-2 rounded-full bg-sky-500 inline-block"></span>
+            Source Server (Immich A — Private)
+          </span>
+        </h2>
+        <button type="button" onclick="testConnection('source')"
+                id="testSourceBtn"
+                class="text-xs px-3 py-1.5 bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 rounded-lg border border-sky-500/20">
+          Test &amp; Load Albums
+        </button>
+      </div>
+
+      <div class="space-y-4">
+        <div>
+          <label for="source_url" class="block text-sm font-medium text-gray-300 mb-1.5">Server URL</label>
+          <input id="source_url" name="source_url" type="url" required
+                 value="{{ job.source_url if job else '' }}"
+                 placeholder="http://immich-private:2283"
+                 class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"/>
+        </div>
+
+        <div>
+          <label for="source_key" class="block text-sm font-medium text-gray-300 mb-1.5">API Key</label>
+          <input id="source_key" name="source_key" type="password" required
+                 value="{{ job.source_key if job else '' }}"
+                 placeholder="••••••••••••••••"
+                 class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"/>
+          <p class="text-xs text-gray-500 mt-1">Generate in Immich → Account Settings → API Keys.</p>
+        </div>
+
+        <div>
+          <label for="source_album_name" class="block text-sm font-medium text-gray-300 mb-1.5">Album to Sync</label>
+          <div class="flex gap-2">
+            <input id="source_album_name" name="source_album_name" type="text" required
+                   value="{{ job.source_album_name if job else '' }}"
+                   placeholder="Family Shared"
+                   class="flex-1 px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"/>
+            <select id="sourceAlbumSelect" onchange="selectSourceAlbum(this)"
+                    class="hidden px-3 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-sky-500">
+              <option value="">— pick album —</option>
+            </select>
+          </div>
+          <p id="sourceTestResult" class="text-xs mt-1.5 hidden"></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Destination server -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-sm font-semibold text-gray-200">
+          <span class="inline-flex items-center gap-1.5">
+            <span class="w-2 h-2 rounded-full bg-green-500 inline-block"></span>
+            Destination Server (Immich B — Public)
+          </span>
+        </h2>
+        <button type="button" onclick="testConnection('dest')"
+                id="testDestBtn"
+                class="text-xs px-3 py-1.5 bg-green-500/10 hover:bg-green-500/20 text-green-400 rounded-lg border border-green-500/20">
+          Test Connection
+        </button>
+      </div>
+
+      <div class="space-y-4">
+        <div>
+          <label for="dest_url" class="block text-sm font-medium text-gray-300 mb-1.5">Server URL</label>
+          <input id="dest_url" name="dest_url" type="url" required
+                 value="{{ job.dest_url if job else '' }}"
+                 placeholder="http://immich-public:2283"
+                 class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"/>
+        </div>
+
+        <div>
+          <label for="dest_key" class="block text-sm font-medium text-gray-300 mb-1.5">API Key</label>
+          <input id="dest_key" name="dest_key" type="password" required
+                 value="{{ job.dest_key if job else '' }}"
+                 placeholder="••••••••••••••••"
+                 class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"/>
+        </div>
+
+        <div>
+          <label for="dest_album_name" class="block text-sm font-medium text-gray-300 mb-1.5">Destination Album Name</label>
+          <input id="dest_album_name" name="dest_album_name" type="text" required
+                 value="{{ job.dest_album_name if job else '' }}"
+                 placeholder="Family Shared"
+                 class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"/>
+          <p class="text-xs text-gray-500 mt-1">Album will be created on the destination if it doesn't exist.</p>
+          <p id="destTestResult" class="text-xs mt-1.5 hidden"></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Schedule -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-sm font-semibold text-gray-200 mb-4">Schedule</h2>
+
+      <!-- Quick presets -->
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
+        <button type="button" onclick="setSchedule('0 */6 * * *')"
+                class="schedule-preset px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs rounded-lg border border-gray-700 text-center">
+          Every 6 hours
+        </button>
+        <button type="button" onclick="setSchedule('0 */12 * * *')"
+                class="schedule-preset px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs rounded-lg border border-gray-700 text-center">
+          Every 12 hours
+        </button>
+        <button type="button" onclick="setSchedule('0 2 * * *')"
+                class="schedule-preset px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs rounded-lg border border-gray-700 text-center">
+          Daily at 2am
+        </button>
+        <button type="button" onclick="setSchedule('0 * * * *')"
+                class="schedule-preset px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs rounded-lg border border-gray-700 text-center">
+          Every hour
+        </button>
+      </div>
+
+      <div>
+        <label for="schedule" class="block text-sm font-medium text-gray-300 mb-1.5">Cron Expression</label>
+        <input id="schedule" name="schedule" type="text" required
+               value="{{ job.schedule if job else '0 */6 * * *' }}"
+               placeholder="0 */6 * * *"
+               class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"/>
+        <p class="text-xs text-gray-500 mt-1">
+          Format: minute hour day month weekday (UTC) — e.g. <code class="font-mono text-gray-400">0 */6 * * *</code> = every 6 hours
+        </p>
+        <p id="scheduleHint" class="text-xs text-sky-400 mt-1"></p>
+      </div>
+    </div>
+
+    <!-- Behavior -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-sm font-semibold text-gray-200 mb-4">Behavior Options</h2>
+      <div class="space-y-4">
+
+        <!-- Enabled toggle -->
+        <label class="flex items-start gap-3 cursor-pointer group">
+          <div class="pt-0.5">
+            <input type="checkbox" name="enabled" value="on" id="enabled"
+                   {% if not job or job.enabled %}checked{% endif %}
+                   class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-sky-500 focus:ring-sky-500 focus:ring-offset-gray-900"/>
+          </div>
+          <div>
+            <p class="text-sm font-medium text-gray-200 group-hover:text-white">Enable this job</p>
+            <p class="text-xs text-gray-500">Uncheck to pause without deleting the job.</p>
+          </div>
+        </label>
+
+        <!-- Cleanup cache -->
+        <label class="flex items-start gap-3 cursor-pointer group">
+          <div class="pt-0.5">
+            <input type="checkbox" name="cleanup_cache" value="on" id="cleanup_cache"
+                   {% if job and job.cleanup_cache %}checked{% endif %}
+                   class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-sky-500 focus:ring-sky-500 focus:ring-offset-gray-900"/>
+          </div>
+          <div>
+            <p class="text-sm font-medium text-gray-200 group-hover:text-white">Clean up cache after upload</p>
+            <p class="text-xs text-gray-500">Delete downloaded originals from the cache directory once they're successfully uploaded. Saves disk space but re-downloads on next run.</p>
+          </div>
+        </label>
+
+        <!-- Delete sync -->
+        <label class="flex items-start gap-3 cursor-pointer group">
+          <div class="pt-0.5">
+            <input type="checkbox" name="delete_sync" value="on" id="delete_sync"
+                   {% if job and job.delete_sync %}checked{% endif %}
+                   class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-red-500 focus:ring-red-500 focus:ring-offset-gray-900"/>
+          </div>
+          <div>
+            <p class="text-sm font-medium text-gray-200 group-hover:text-white">
+              Mirror deletes
+              <span class="ml-1 text-xs bg-yellow-900/50 text-yellow-400 px-1.5 py-0.5 rounded border border-yellow-700/50">Experimental</span>
+            </p>
+            <p class="text-xs text-gray-500">If an asset is removed from the source album, remove it from the destination too. Not recommended for family sharing — use add-only mode instead.</p>
+          </div>
+        </label>
+      </div>
+    </div>
+
+    <!-- Submit -->
+    <div class="flex flex-col sm:flex-row gap-3">
+      <button type="submit"
+              class="flex-1 sm:flex-none px-6 py-2.5 bg-sky-500 hover:bg-sky-400 text-white font-semibold rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 active:scale-95">
+        {% if job %}Save Changes{% else %}Create Job{% endif %}
+      </button>
+      <a href="/jobs"
+         class="flex-1 sm:flex-none px-6 py-2.5 bg-gray-800 hover:bg-gray-700 text-gray-300 font-medium rounded-lg text-sm text-center border border-gray-700">
+        Cancel
+      </a>
+    </div>
+
+  </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  function setSchedule(value) {
+    document.getElementById('schedule').value = value;
+    updateScheduleHint();
+  }
+
+  function updateScheduleHint() {
+    const val = document.getElementById('schedule').value.trim();
+    const hints = {
+      '0 */6 * * *': 'Every 6 hours (midnight, 6am, noon, 6pm UTC)',
+      '0 */12 * * *': 'Every 12 hours (midnight and noon UTC)',
+      '0 2 * * *': 'Daily at 2:00 AM UTC',
+      '0 * * * *': 'Every hour on the hour',
+      '0 0 * * *': 'Daily at midnight UTC',
+      '*/30 * * * *': 'Every 30 minutes',
+    };
+    const hint = document.getElementById('scheduleHint');
+    hint.textContent = hints[val] || '';
+  }
+
+  document.getElementById('schedule').addEventListener('input', updateScheduleHint);
+  updateScheduleHint();
+
+  async function testConnection(side) {
+    const url = document.getElementById(side + '_url').value.trim();
+    const key = document.getElementById(side + '_key').value.trim();
+    const btn = document.getElementById('test' + (side === 'source' ? 'Source' : 'Dest') + 'Btn');
+    const result = document.getElementById(side + 'TestResult');
+
+    if (!url || !key) {
+      result.textContent = '⚠ Please fill in URL and API key first.';
+      result.className = 'text-xs mt-1.5 text-yellow-400';
+      result.classList.remove('hidden');
+      return;
+    }
+
+    const orig = btn.textContent;
+    btn.textContent = 'Testing…';
+    btn.disabled = true;
+
+    try {
+      const res = await fetch('/api/test-connection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, api_key: key })
+      });
+      const data = await res.json();
+
+      if (data.success) {
+        result.textContent = `✓ Connected — ${data.albums.length} album(s) found`;
+        result.className = 'text-xs mt-1.5 text-green-400';
+        result.classList.remove('hidden');
+
+        if (side === 'source' && data.albums.length > 0) {
+          const sel = document.getElementById('sourceAlbumSelect');
+          sel.innerHTML = '<option value="">— pick album —</option>';
+          data.albums.forEach(a => {
+            const opt = document.createElement('option');
+            opt.value = a.name;
+            opt.textContent = `${a.name} (${a.asset_count} assets)`;
+            sel.appendChild(opt);
+          });
+          sel.classList.remove('hidden');
+        }
+      } else {
+        result.textContent = '✗ ' + (data.error || 'Connection failed');
+        result.className = 'text-xs mt-1.5 text-red-400';
+        result.classList.remove('hidden');
+      }
+    } catch(e) {
+      result.textContent = '✗ Request error: ' + e.message;
+      result.className = 'text-xs mt-1.5 text-red-400';
+      result.classList.remove('hidden');
+    } finally {
+      btn.textContent = orig;
+      btn.disabled = false;
+    }
+  }
+
+  function selectSourceAlbum(sel) {
+    if (sel.value) {
+      document.getElementById('source_album_name').value = sel.value;
+    }
+  }
+</script>
+{% endblock %}

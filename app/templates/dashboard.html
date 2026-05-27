@@ -1,0 +1,189 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Immich Album Sync{% endblock %}
+
+{% block content %}
+<div class="p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">
+
+  <!-- Page header -->
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      <h1 class="text-xl font-bold text-white">Dashboard</h1>
+      <p class="text-sm text-gray-400 mt-0.5">Overview of all sync jobs</p>
+    </div>
+    <a href="/jobs/new"
+       class="flex items-center gap-2 px-4 py-2 bg-sky-500 hover:bg-sky-400 text-white text-sm font-medium rounded-lg active:scale-95">
+      <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+      <span class="hidden sm:inline">New Job</span>
+    </a>
+  </div>
+
+  <!-- Stats row -->
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-8">
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <p class="text-xs text-gray-400 uppercase tracking-wide mb-1">Total Jobs</p>
+      <p class="text-2xl font-bold text-white">{{ total_jobs }}</p>
+    </div>
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <p class="text-xs text-gray-400 uppercase tracking-wide mb-1">Active</p>
+      <p class="text-2xl font-bold text-sky-400">{{ enabled_jobs }}</p>
+    </div>
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <p class="text-xs text-gray-400 uppercase tracking-wide mb-1">Paused</p>
+      <p class="text-2xl font-bold text-gray-400">{{ total_jobs - enabled_jobs }}</p>
+    </div>
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <p class="text-xs text-gray-400 uppercase tracking-wide mb-1">Recent Errors</p>
+      {% set error_count = recent_runs | selectattr('status', 'equalto', 'failed') | list | length %}
+      <p class="text-2xl font-bold {% if error_count > 0 %}text-red-400{% else %}text-green-400{% endif %}">{{ error_count }}</p>
+    </div>
+  </div>
+
+  <!-- Job cards -->
+  {% if job_cards %}
+  <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">Sync Jobs</h2>
+  <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mb-8">
+    {% for item in job_cards %}
+    {% set job = item.job %}
+    {% set last = item.last_run %}
+    {% set nxt = item.next_run %}
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 flex flex-col gap-4 hover:border-gray-700 transition-colors">
+
+      <!-- Header row -->
+      <div class="flex items-start justify-between gap-2">
+        <div class="min-w-0">
+          <h3 class="font-semibold text-white text-sm truncate">{{ job.name }}</h3>
+          <p class="text-xs text-gray-500 mt-0.5 truncate">{{ job.source_album_name }} → {{ job.dest_album_name }}</p>
+        </div>
+        <!-- Status badge -->
+        {% if not job.enabled %}
+          <span class="badge-disabled text-xs px-2 py-0.5 rounded-full whitespace-nowrap font-medium">Paused</span>
+        {% elif last and last.status == 'running' %}
+          <span class="badge-running text-xs px-2 py-0.5 rounded-full whitespace-nowrap font-medium animate-pulse">Running</span>
+        {% elif last and last.status == 'failed' %}
+          <span class="badge-failed text-xs px-2 py-0.5 rounded-full whitespace-nowrap font-medium">Failed</span>
+        {% elif last and last.status == 'partial' %}
+          <span class="badge-partial text-xs px-2 py-0.5 rounded-full whitespace-nowrap font-medium">Partial</span>
+        {% elif last and last.status == 'success' %}
+          <span class="badge-success text-xs px-2 py-0.5 rounded-full whitespace-nowrap font-medium">OK</span>
+        {% else %}
+          <span class="badge-disabled text-xs px-2 py-0.5 rounded-full whitespace-nowrap font-medium">Never run</span>
+        {% endif %}
+      </div>
+
+      <!-- Server info -->
+      <div class="text-xs text-gray-500 space-y-1">
+        <div class="flex items-center gap-1.5 truncate">
+          <svg class="w-3 h-3 text-sky-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M12 5l7 7-7 7"/></svg>
+          <span class="truncate">{{ job.source_url }}</span>
+        </div>
+        <div class="flex items-center gap-1.5 truncate">
+          <svg class="w-3 h-3 text-green-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 12H5M12 5l-7 7 7 7"/></svg>
+          <span class="truncate">{{ job.dest_url }}</span>
+        </div>
+      </div>
+
+      <!-- Timing -->
+      <div class="text-xs text-gray-500 space-y-1">
+        {% if last %}
+        <div class="flex justify-between">
+          <span>Last run</span>
+          <span class="text-gray-300">{{ last.started_at | datetimefmt }}</span>
+        </div>
+        <div class="flex justify-between">
+          <span>Uploaded</span>
+          <span class="text-gray-300">{{ last.assets_uploaded }} files</span>
+        </div>
+        {% endif %}
+        {% if nxt and job.enabled %}
+        <div class="flex justify-between">
+          <span>Next run</span>
+          <span class="text-sky-400">{{ nxt | datetimefmt }}</span>
+        </div>
+        {% endif %}
+        <div class="flex justify-between">
+          <span>Schedule</span>
+          <span class="font-mono text-gray-400">{{ job.schedule }}</span>
+        </div>
+      </div>
+
+      <!-- Actions -->
+      <div class="flex items-center gap-2 pt-1 border-t border-gray-800">
+        <button onclick="runJobNow({{ job.id }}, this)"
+                class="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 text-xs rounded-lg border border-sky-500/20">
+          <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+          Run now
+        </button>
+        <a href="/jobs/{{ job.id }}/edit"
+           class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs rounded-lg border border-gray-700">
+          Edit
+        </a>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="text-center py-16 bg-gray-900 border border-dashed border-gray-700 rounded-2xl">
+    <svg class="w-12 h-12 text-gray-600 mx-auto mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+    <p class="text-gray-400 font-medium mb-1">No sync jobs yet</p>
+    <p class="text-gray-600 text-sm mb-4">Create your first job to start syncing albums between servers.</p>
+    <a href="/jobs/new" class="px-5 py-2 bg-sky-500 hover:bg-sky-400 text-white text-sm font-medium rounded-lg">
+      Create your first job
+    </a>
+  </div>
+  {% endif %}
+
+  <!-- Recent runs -->
+  {% if recent_runs %}
+  <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">Recent Runs</h2>
+  <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="text-xs text-gray-500 uppercase tracking-wide border-b border-gray-800">
+            <th class="text-left px-4 py-3">Job</th>
+            <th class="text-left px-4 py-3 hidden sm:table-cell">Started</th>
+            <th class="text-left px-4 py-3">Status</th>
+            <th class="text-right px-4 py-3 hidden md:table-cell">Uploaded</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-800">
+          {% for run in recent_runs %}
+          <tr class="hover:bg-gray-800/50">
+            <td class="px-4 py-3 text-gray-300 max-w-[160px] truncate">{{ run._job_name }}</td>
+            <td class="px-4 py-3 text-gray-500 hidden sm:table-cell whitespace-nowrap">{{ run.started_at | datetimefmt }}</td>
+            <td class="px-4 py-3">
+              <span class="badge-{{ run.status }} text-xs px-2 py-0.5 rounded-full font-medium">{{ run.status }}</span>
+            </td>
+            <td class="px-4 py-3 text-right text-gray-400 hidden md:table-cell">{{ run.assets_uploaded }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function runJobNow(jobId, btn) {
+  btn.disabled = true;
+  btn.innerHTML = '<svg class="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg> Starting…';
+  try {
+    const res = await fetch(`/jobs/${jobId}/run`, { method: 'POST' });
+    const data = await res.json();
+    if (data.status === 'started') {
+      window.location.href = '/logs';
+    } else {
+      alert('Error: ' + (data.error || 'Unknown error'));
+      location.reload();
+    }
+  } catch(e) {
+    alert('Request failed: ' + e);
+    location.reload();
+  }
+}
+</script>
+{% endblock %}

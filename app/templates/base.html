@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-gray-950">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}Immich Album Sync{% endblock %}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            immich: { 50:'#f0f9ff', 100:'#e0f2fe', 500:'#0ea5e9', 600:'#0284c7', 700:'#0369a1' }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* Smooth transitions */
+    * { transition-property: background-color, border-color, color, opacity; transition-duration: 150ms; }
+    /* Sidebar active link */
+    .nav-active { background-color: rgba(14,165,233,0.15); color: #38bdf8; }
+    /* Status badge colours */
+    .badge-success  { background:#14532d; color:#86efac; }
+    .badge-failed   { background:#450a0a; color:#fca5a5; }
+    .badge-running  { background:#1c1917; color:#fdba74; }
+    .badge-partial  { background:#431407; color:#fb923c; }
+    .badge-disabled { background:#1f2937; color:#9ca3af; }
+    /* Scrollbar */
+    ::-webkit-scrollbar { width:6px; height:6px; }
+    ::-webkit-scrollbar-track { background:#111827; }
+    ::-webkit-scrollbar-thumb { background:#374151; border-radius:3px; }
+  </style>
+</head>
+<body class="h-full flex flex-col bg-gray-950 text-gray-100 font-sans">
+
+  <!-- ===================== TOP NAV (mobile) ===================== -->
+  <header class="lg:hidden flex items-center justify-between px-4 py-3 bg-gray-900 border-b border-gray-800 sticky top-0 z-50">
+    <div class="flex items-center gap-2">
+      <!-- Logo icon -->
+      <svg class="w-7 h-7 text-immich-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M3 16l4-4 4 4 4-6 4 6"/>
+        <circle cx="18" cy="6" r="2" fill="currentColor" stroke="none"/>
+        <rect x="2" y="3" width="20" height="18" rx="3" stroke-width="1.5" fill="none"/>
+      </svg>
+      <span class="font-semibold text-white text-sm tracking-wide">Immich Sync</span>
+    </div>
+    <button id="mobileMenuBtn" class="p-2 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800">
+      <svg id="menuIconOpen" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
+      <svg id="menuIconClose" class="w-5 h-5 hidden" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+    </button>
+  </header>
+
+  <div class="flex flex-1 overflow-hidden">
+
+    <!-- ===================== SIDEBAR ===================== -->
+    <aside id="sidebar"
+           class="fixed inset-y-0 left-0 z-40 w-56 bg-gray-900 border-r border-gray-800 flex flex-col
+                  transform -translate-x-full lg:translate-x-0 lg:static lg:flex
+                  transition-transform duration-200 ease-in-out pt-16 lg:pt-0">
+
+      <!-- Brand (desktop) -->
+      <div class="hidden lg:flex items-center gap-3 px-5 py-5 border-b border-gray-800">
+        <svg class="w-8 h-8 text-immich-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M3 16l4-4 4 4 4-6 4 6"/>
+          <circle cx="18" cy="6" r="2" fill="currentColor" stroke="none"/>
+          <rect x="2" y="3" width="20" height="18" rx="3" stroke-width="1.5" fill="none"/>
+        </svg>
+        <div>
+          <p class="font-semibold text-white text-sm leading-tight">Immich</p>
+          <p class="text-xs text-gray-400 leading-tight">Album Sync</p>
+        </div>
+      </div>
+
+      <!-- Nav links -->
+      <nav class="flex-1 px-3 py-4 space-y-1">
+        {% set current = request.url.path %}
+
+        <a href="/"
+           class="flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-gray-300 hover:bg-gray-800 hover:text-white
+                  {% if current == '/' %}nav-active{% endif %}">
+          <svg class="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
+          Dashboard
+        </a>
+
+        <a href="/jobs"
+           class="flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-gray-300 hover:bg-gray-800 hover:text-white
+                  {% if current.startswith('/jobs') %}nav-active{% endif %}">
+          <svg class="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+          Sync Jobs
+        </a>
+
+        <a href="/logs"
+           class="flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-gray-300 hover:bg-gray-800 hover:text-white
+                  {% if current == '/logs' %}nav-active{% endif %}">
+          <svg class="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+          Live Logs
+        </a>
+
+        <a href="/settings"
+           class="flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-gray-300 hover:bg-gray-800 hover:text-white
+                  {% if current == '/settings' %}nav-active{% endif %}">
+          <svg class="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+          Settings
+        </a>
+      </nav>
+
+      <!-- Logout -->
+      <div class="px-3 pb-4 border-t border-gray-800 pt-4">
+        <a href="/logout"
+           class="flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-gray-400 hover:bg-gray-800 hover:text-red-400">
+          <svg class="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
+          Sign out
+        </a>
+      </div>
+    </aside>
+
+    <!-- Sidebar overlay (mobile) -->
+    <div id="sidebarOverlay" class="fixed inset-0 z-30 bg-black/60 hidden lg:hidden"></div>
+
+    <!-- ===================== MAIN CONTENT ===================== -->
+    <main class="flex-1 overflow-y-auto">
+      <!-- Flash messages -->
+      {% if request.query_params.get('success') %}
+      <div class="mx-4 mt-4 px-4 py-3 rounded-lg bg-green-900/50 border border-green-700 text-green-300 text-sm flex items-center gap-2">
+        <svg class="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+        {{ request.query_params.get('success') }}
+      </div>
+      {% endif %}
+      {% if request.query_params.get('error') %}
+      <div class="mx-4 mt-4 px-4 py-3 rounded-lg bg-red-900/50 border border-red-700 text-red-300 text-sm flex items-center gap-2">
+        <svg class="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        {{ request.query_params.get('error') }}
+      </div>
+      {% endif %}
+
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+
+  <script>
+    // Mobile menu toggle
+    const btn = document.getElementById('mobileMenuBtn');
+    const sidebar = document.getElementById('sidebar');
+    const overlay = document.getElementById('sidebarOverlay');
+    const iconOpen = document.getElementById('menuIconOpen');
+    const iconClose = document.getElementById('menuIconClose');
+
+    function openMenu() {
+      sidebar.classList.remove('-translate-x-full');
+      overlay.classList.remove('hidden');
+      iconOpen.classList.add('hidden');
+      iconClose.classList.remove('hidden');
+    }
+    function closeMenu() {
+      sidebar.classList.add('-translate-x-full');
+      overlay.classList.add('hidden');
+      iconOpen.classList.remove('hidden');
+      iconClose.classList.add('hidden');
+    }
+
+    btn.addEventListener('click', () => sidebar.classList.contains('-translate-x-full') ? openMenu() : closeMenu());
+    overlay.addEventListener('click', closeMenu);
+  </script>
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>
