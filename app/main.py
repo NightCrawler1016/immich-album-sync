@@ -13,8 +13,8 @@ from fastapi.responses import (
     RedirectResponse,
     StreamingResponse,
 )
+import bcrypt as _bcrypt
 from fastapi.templating import Jinja2Templates
-from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -51,7 +51,14 @@ templates.env.filters["datetimefmt"] = lambda dt, fmt="%Y-%m-%d %H:%M": (
     dt.strftime(fmt) if dt else "—"
 )
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+def _hash_password(plain: str) -> str:
+    return _bcrypt.hashpw(plain.encode("utf-8"), _bcrypt.gensalt()).decode("utf-8")
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return _bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -138,7 +145,7 @@ async def login_post(
     db: Session = Depends(get_db),
 ):
     admin_username, admin_hash = _get_admin_creds(db)
-    if username == admin_username and admin_hash and pwd_context.verify(password, admin_hash):
+    if username == admin_username and admin_hash and _verify_password(password, admin_hash):
         request.session["user"] = username
         return RedirectResponse("/", status_code=302)
     return templates.TemplateResponse(
@@ -566,7 +573,7 @@ async def settings_password(
         return RedirectResponse("/login", status_code=302)
 
     _, admin_hash = _get_admin_creds(db)
-    if not admin_hash or not pwd_context.verify(current_password, admin_hash):
+    if not admin_hash or not _verify_password(current_password, admin_hash):
         return RedirectResponse("/settings?error=Current+password+incorrect", status_code=302)
 
     if new_password != confirm_password:
@@ -575,7 +582,7 @@ async def settings_password(
     if len(new_password) < 8:
         return RedirectResponse("/settings?error=Password+must+be+at+least+8+characters", status_code=302)
 
-    _upsert_setting(db, "admin_password_hash", pwd_context.hash(new_password))
+    _upsert_setting(db, "admin_password_hash", _hash_password(new_password))
     return RedirectResponse("/settings?success=Password+updated+successfully", status_code=302)
 
 
