@@ -33,17 +33,18 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
+# Copy application and entrypoint
 COPY app/ ./app/
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-# Create default appdata directories (will be overridden by volume mount)
-# Note: running as root for Unraid compatibility — Unraid manages its own
-# security model and mounts host directories as root-owned.
+# Pre-create appdata directories in the image as a fallback.
+# These are overridden when Unraid mounts the appdata volume.
 RUN mkdir -p /app/appdata/cache /app/appdata/logs
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "info"]
+ENTRYPOINT ["/entrypoint.sh"]

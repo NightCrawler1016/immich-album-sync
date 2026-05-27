@@ -6,8 +6,10 @@ from sqlalchemy.orm import sessionmaker, DeclarativeBase
 logger = logging.getLogger(__name__)
 
 # Database path — use the appdata volume mount
+# NOTE: do NOT call os.makedirs here at module level.
+# Directory creation happens inside init_db() so any failure
+# is caught by FastAPI's startup error handling and logged properly.
 DB_PATH = os.getenv("DB_PATH", "/app/appdata/config.db")
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 
@@ -35,10 +37,17 @@ def get_db():
 
 def init_db():
     """Create all tables and seed default admin credentials."""
+    # Ensure the appdata directory exists before SQLite tries to create the file.
+    # Done here (not at module level) so failures are visible in the startup log.
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+        logger.info(f"Appdata directory ready: {db_dir}")
+
     from . import models  # noqa: F401 — ensures models are registered
 
     Base.metadata.create_all(bind=engine)
-    logger.info("Database initialized")
+    logger.info(f"Database initialized at {DB_PATH}")
 
     db = SessionLocal()
     try:
