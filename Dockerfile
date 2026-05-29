@@ -8,15 +8,16 @@ LABEL org.opencontainers.image.licenses="MIT"
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    jq \
     ca-certificates \
     tar \
     && rm -rf /var/lib/apt/lists/*
 
-# Install immich-go binary.
+# Install immich-go binary (pinned to a tested version to avoid breaking CLI changes).
 # Use uname -m to detect the real running architecture — reliable under
 # both native builds and QEMU cross-compilation (where ARG TARGETARCH
 # can silently stay at its default value instead of being overridden).
+# v0.31.0 uses: immich-go upload from-folder --into-album NAME --recursive DIR
+ENV IMMICH_GO_VERSION=v0.31.0
 RUN set -ex && \
     ARCH=$(uname -m) && \
     case "$ARCH" in \
@@ -24,10 +25,8 @@ RUN set -ex && \
         aarch64) BIN_ARCH="arm64" ;; \
         *)       BIN_ARCH="x86_64" ;; \
     esac && \
-    LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/simulot/immich-go/releases/latest" \
-        | grep '"tag_name"' | head -1 | cut -d'"' -f4) && \
-    echo "Installing immich-go ${LATEST_TAG} for arch=${ARCH} (${BIN_ARCH})" && \
-    curl -fsSL "https://github.com/simulot/immich-go/releases/download/${LATEST_TAG}/immich-go_Linux_${BIN_ARCH}.tar.gz" \
+    echo "Installing immich-go ${IMMICH_GO_VERSION} for arch=${ARCH} (${BIN_ARCH})" && \
+    curl -fsSL "https://github.com/simulot/immich-go/releases/download/${IMMICH_GO_VERSION}/immich-go_Linux_${BIN_ARCH}.tar.gz" \
         -o /tmp/immich-go.tar.gz && \
     mkdir -p /tmp/immich-go-extract && \
     tar -xzf /tmp/immich-go.tar.gz -C /tmp/immich-go-extract && \
