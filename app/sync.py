@@ -245,23 +245,23 @@ async def _run_immich_go_upload(
     Supports immich-go v0.22+ command structure.
     Returns {"uploaded": int, "error": str|None}
     """
-    # immich-go v0.31+ syntax:
-    #   immich-go --server URL --api-key KEY upload from-folder --into-album NAME --recursive DIR
-    # NOTE: the flag was renamed from --album to --into-album in v0.31
+    # immich-go v0.31 syntax (flags go AFTER the subcommand, matching README examples):
+    #   immich-go upload from-folder --server URL --api-key KEY --into-album NAME --recursive DIR
+    # NOTE: placing --server/--api-key before "upload" as global flags breaks v0.31's
+    #       argument parser — they must follow the "from-folder" subcommand.
     cmd = [
         "immich-go",
-        "--server", server,
-        "--api-key", api_key,
-        "--no-ui",
         "upload",
         "from-folder",
+        "--server", server,
+        "--api-key", api_key,
         "--into-album", album_name,
         "--recursive",
         source_dir,
     ]
 
     sync_log.info(
-        f"   CMD    : immich-go --server {server} upload from-folder "
+        f"   CMD    : immich-go upload from-folder --server {server} "
         f"--into-album '{album_name}' {source_dir}"
     )
 
