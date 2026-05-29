@@ -135,14 +135,23 @@ For large first-time syncs (hundreds of GB or multi-TB albums), you may want the
 
 The sync engine will write all downloaded originals to that path. The main `/app/appdata` volume (database, logs) is unaffected.
 
-**docker-compose example:**
+**docker-compose example with separate cache volume:**
 
 ```yaml
-volumes:
-  - ./appdata:/app/appdata          # database + logs
-  - /mnt/big-drive/sync-cache:/app/cache   # large cache on separate disk
-environment:
-  CACHE_PATH: /app/cache
+services:
+  immich-album-sync:
+    image: ghcr.io/nightcrawler1016/immich-album-sync:latest
+    container_name: immich-album-sync
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./appdata:/app/appdata                     # database + logs (small, keep on fast drive)
+      - /mnt/big-drive/sync-cache:/app/cache       # large cache on a different disk or share
+    environment:
+      SECRET_KEY: "replace-with-your-random-key"
+      TZ: "America/New_York"
+      CACHE_PATH: /app/cache
 ```
 
 ---
@@ -226,12 +235,12 @@ With the default 10 GB limit, syncs under 10 GB behave exactly as before (single
 ## How It Works
 
 1. At the scheduled time, the sync engine connects to **Immich A** via its REST API
-2. Finds the configured source album by name and lists all assets
-3. Downloads all original files (including Live Photo `.MOV` companions) to the local cache
-4. Uploads to **Immich B** using [`immich-go`](https://github.com/simulot/immich-go) (v0.31.0), which performs duplicate detection on the destination
+2. Finds the configured source album by name and lists all assets (including Live Photo `.MOV` companions)
+3. Downloads original files to the local cache in rolling batches — once a batch reaches `BATCH_SIZE_MB` (default 10 GB) or `BATCH_FILE_COUNT`, it is immediately uploaded and cleared before the next batch begins
+4. Uploads each batch to **Immich B** using [`immich-go`](https://github.com/simulot/immich-go) (v0.31.0), which performs duplicate detection on the destination
 5. Logs all activity to `/app/appdata/logs/sync.log`, viewable live in the browser
 
-Files already present in the cache are skipped on re-download. `immich-go` skips files already present on the destination server.
+Files already present in the cache are skipped on re-download. `immich-go` skips files already present on the destination. For albums under 10 GB the engine processes everything as a single batch — identical to a traditional download-then-upload flow.
 
 ---
 
@@ -282,11 +291,15 @@ In the **Live Logs** page, click **Download Support Bundle** to get a ZIP contai
 | Symptom | Likely Cause | Fix |
 |---|---|---|
 | Container starts but no logs | Wrong volume mapping | Ensure `/app/appdata` is mapped to a writable host path |
+| Redirected to "Set Your Password" on login | First-login prompt (by design) | Set a new password — you cannot skip this step |
 | "Invalid username or password" | Wrong credentials | Default is `admin` / `admin`; check Settings if you changed it |
 | API key test fails | Insufficient permissions | Use Immich's API key settings to grant required roles (see table above) |
 | `SECRET_KEY` warning in logs | Using default or short key | Set a 32–64 character unique key in environment variables |
 | Sync runs but 0 uploads | Duplicates already on dest | Normal — `immich-go` skips files already present |
 | Album not visible after sync | Immich UI cache | Refresh your Immich browser tab or wait a moment |
+| Cache fills up during large sync | Batch size too large for disk | Lower `BATCH_SIZE_MB` (e.g. `2048` for 2 GB batches) or route cache to a larger disk |
+| Sync stops mid-way with "partial" status | Upload error during a batch | Cached files are kept — fix the error and re-run; completed batches won't re-upload |
+| Want to use a network share for cache | Default cache is on main appdata | Add a second Docker volume mapping and set `CACHE_PATH` (see [Cache on external storage](#cache-on-external-storage-or-a-different-disk)) |
 
 ---
 
