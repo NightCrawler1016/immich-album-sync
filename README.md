@@ -105,10 +105,12 @@ Sessions are signed with `SECRET_KEY` using `itsdangerous` and expire after 24 h
 |---|---|---|---|
 | `SECRET_KEY` | ✅ Yes | `change-me` | 32–64 char random string for session signing and API key encryption |
 | `TZ` | No | `UTC` | Container timezone (e.g. `America/New_York`) |
-| `CLEANUP_CACHE` | No | `false` | Delete cached files after upload (`true`/`false`) |
+| `CLEANUP_CACHE` | No | `false` | Delete cached files after final upload (`true`/`false`) |
+| `CACHE_PATH` | No | `/app/appdata/cache` | Download cache directory (see [Cache on external storage](#cache-on-external-storage-or-a-different-disk)) |
+| `BATCH_SIZE_MB` | No | `10240` | Max MB to stage before uploading a batch (0 = unlimited) |
+| `BATCH_FILE_COUNT` | No | `0` | Max files per batch (0 = unlimited, size limit still applies) |
 | `DB_PATH` | No | `/app/appdata/config.db` | SQLite database path |
 | `LOG_PATH` | No | `/app/appdata/logs/sync.log` | Sync log file path |
-| `CACHE_PATH` | No | `/app/appdata/cache` | Download cache directory |
 
 ---
 
@@ -119,6 +121,29 @@ Sessions are signed with `SECRET_KEY` using `itsdangerous` and expire after 24 h
 | `/app/appdata` | All persistent data: database, cache, and logs |
 
 Map this to a path on your Unraid array, e.g. `/mnt/user/appdata/immich-album-sync`.
+
+### Cache on External Storage or a Different Disk
+
+For large first-time syncs (hundreds of GB or multi-TB albums), you may want the download cache on a high-capacity array disk, a separate SSD pool, or a network share — rather than your primary Unraid cache pool.
+
+**Unraid / Docker setup:**
+
+1. Add a **second Path mapping** in the Docker template:
+   - Container path: `/app/cache`
+   - Host path: `/mnt/user/YourLargeDisk/immich-sync-cache` *(or any writable path)*
+2. Set the `CACHE_PATH` environment variable to: `/app/cache`
+
+The sync engine will write all downloaded originals to that path. The main `/app/appdata` volume (database, logs) is unaffected.
+
+**docker-compose example:**
+
+```yaml
+volumes:
+  - ./appdata:/app/appdata          # database + logs
+  - /mnt/big-drive/sync-cache:/app/cache   # large cache on separate disk
+environment:
+  CACHE_PATH: /app/cache
+```
 
 ---
 
@@ -152,6 +177,49 @@ Map this to a path on your Unraid array, e.g. `/mnt/user/appdata/immich-album-sy
 | Destination (Immich B) | `album.read`, `album.write`, `asset.read`, `asset.write` |
 
 See [Immich API Key documentation](https://immich.app/docs/features/api-keys) for how to create keys with specific permissions.
+
+---
+
+## Batch Processing
+
+The sync engine automatically processes large albums in rolling batches to prevent the local cache from filling up your disk.
+
+### How batching works
+
+Instead of downloading the entire album before uploading anything, the engine:
+
+1. Downloads files until either `BATCH_SIZE_MB` or `BATCH_FILE_COUNT` is reached
+2. Uploads that batch to the destination server
+3. Clears the batch from the cache
+4. Repeats until all files are processed
+
+The **final batch** respects your `CLEANUP_CACHE` setting — intermediate batches are always cleared.
+
+### Defaults
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `BATCH_SIZE_MB` | `10240` (10 GB) | Flush every 10 GB of downloaded data |
+| `BATCH_FILE_COUNT` | `0` | No file-count limit (size limit still applies) |
+
+With the default 10 GB limit, syncs under 10 GB behave exactly as before (single batch). Syncs over 10 GB are automatically split — you'll see progress in the live log like:
+
+```
+─── Batch 1: 247 files (9.98 GB) — 831 items remaining ───
+   Batch 1: 212 uploaded to destination
+   Batch 1: cache cleared, ready for next batch
+─── Batch 2: 231 files (10.01 GB) — 600 items remaining ───
+...
+```
+
+### Tuning for your setup
+
+| Scenario | Recommendation |
+|---|---|
+| Unraid cache pool is small (< 50 GB) | Lower `BATCH_SIZE_MB` to `5120` (5 GB) or `2048` (2 GB) |
+| Cache on large array disk or NAS share | Raise `BATCH_SIZE_MB` or set to `0` (disable) |
+| Very large files (4K video, RAW) | Lower `BATCH_FILE_COUNT` to `100–250` |
+| Want to disable batching entirely | Set both `BATCH_SIZE_MB=0` and `BATCH_FILE_COUNT=0` |
 
 ---
 
