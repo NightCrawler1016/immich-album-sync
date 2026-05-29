@@ -58,6 +58,8 @@ def init_db():
         if not db.query(Settings).filter(Settings.key == "admin_password_hash").first():
             hashed = bcrypt.hashpw(b"admin", bcrypt.gensalt()).decode("utf-8")
             db.add(Settings(key="admin_password_hash", value=hashed))
+            # Flag forces the password-change prompt on first login
+            db.add(Settings(key="password_changed", value="false"))
             logger.info("Default admin password set to 'admin' — please change it immediately")
 
         if not db.query(Settings).filter(Settings.key == "admin_username").first():

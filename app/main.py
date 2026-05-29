@@ -86,6 +86,26 @@ def _decrypt_key(stored: str) -> str:
 
 @app.on_event("startup")
 async def startup():
+    # Validate SECRET_KEY before anything else
+    _default_key = "change-me-to-something-random-and-long"
+    if SECRET_KEY == _default_key:
+        logger.warning(
+            "⚠️  SECRET_KEY is the default value — this is INSECURE. "
+            "Set a unique key in your environment variables."
+        )
+    elif len(SECRET_KEY) < 16:
+        logger.warning(
+            f"⚠️  SECRET_KEY is only {len(SECRET_KEY)} characters. "
+            "Minimum recommended length is 32 characters."
+        )
+    elif len(SECRET_KEY) > 128:
+        logger.warning(
+            f"⚠️  SECRET_KEY is {len(SECRET_KEY)} characters. "
+            "Values longer than 128 characters provide no additional security benefit."
+        )
+    else:
+        logger.info(f"SECRET_KEY: {len(SECRET_KEY)} characters ✓")
+
     init_db()
     init_scheduler()
 
@@ -166,6 +186,11 @@ async def login_post(
     admin_username, admin_hash = _get_admin_creds(db)
     if username == admin_username and admin_hash and _verify_password(password, admin_hash):
         request.session["user"] = username
+        # Check if first-login password change is still required
+        pw_row = db.query(Settings).filter(Settings.key == "password_changed").first()
+        if pw_row and pw_row.value == "false":
+            request.session["must_change_password"] = True
+            return RedirectResponse("/change-password", status_code=302)
         return RedirectResponse("/", status_code=302)
     return templates.TemplateResponse(
         "login.html", {"request": request, "error": "Invalid username or password"}
@@ -179,6 +204,50 @@ async def logout(request: Request):
 
 
 # --------------------------------------------------------------------------- #
+# Forced first-login password change
+# --------------------------------------------------------------------------- #
+
+@app.get("/change-password", response_class=HTMLResponse)
+async def change_password_get(request: Request):
+    """Standalone page displayed when the default password has never been changed."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=302)
+    return templates.TemplateResponse(
+        "change_password.html", {"request": request, "error": None}
+    )
+
+
+@app.post("/change-password")
+async def change_password_post(
+    request: Request,
+    new_password: str = Form(...),
+    confirm_password: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=302)
+
+    error = None
+    if new_password != confirm_password:
+        error = "Passwords do not match."
+    elif len(new_password) < 8:
+        error = "Password must be at least 8 characters."
+    elif new_password.strip().lower() == "admin":
+        error = "You cannot reuse the default password. Please choose a unique password."
+
+    if error:
+        return templates.TemplateResponse(
+            "change_password.html", {"request": request, "error": error}
+        )
+
+    _upsert_setting(db, "admin_password_hash", _hash_password(new_password))
+    _upsert_setting(db, "password_changed", "true")
+    request.session.pop("must_change_password", None)
+    logger.info("Admin password changed from default on first login")
+    return RedirectResponse("/", status_code=302)
+
+
+# --------------------------------------------------------------------------- #
 # Dashboard
 # --------------------------------------------------------------------------- #
 
@@ -186,6 +255,8 @@ async def logout(request: Request):
 async def dashboard(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse("/change-password", status_code=302)
 
     jobs = db.query(SyncJob).order_by(SyncJob.created_at).all()
 
@@ -236,6 +307,8 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
 async def jobs_list(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse("/change-password", status_code=302)
 
     jobs = db.query(SyncJob).order_by(SyncJob.created_at).all()
     job_rows = []
@@ -263,6 +336,8 @@ async def jobs_list(request: Request, db: Session = Depends(get_db)):
 async def job_new_get(request: Request):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse("/change-password", status_code=302)
     return templates.TemplateResponse(
         "job_form.html", {
             "request": request,
@@ -330,6 +405,8 @@ async def job_new_post(
 async def job_edit_get(request: Request, job_id: int, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse("/change-password", status_code=302)
     job = db.query(SyncJob).filter(SyncJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -518,6 +595,8 @@ async def _run_background(job_id: int, run_id: int):
 async def logs_page(request: Request):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse("/change-password", status_code=302)
     return templates.TemplateResponse("logs.html", {"request": request})
 
 
@@ -672,6 +751,8 @@ async def download_support_bundle(request: Request, db: Session = Depends(get_db
 async def settings_get(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse("/change-password", status_code=302)
     settings = {s.key: s.value for s in db.query(Settings).all()}
     return templates.TemplateResponse(
         "settings.html",
@@ -719,6 +800,8 @@ async def settings_password(
         return RedirectResponse("/settings?error=Password+must+be+at+least+8+characters", status_code=302)
 
     _upsert_setting(db, "admin_password_hash", _hash_password(new_password))
+    _upsert_setting(db, "password_changed", "true")
+    request.session.pop("must_change_password", None)
     return RedirectResponse("/settings?success=Password+updated+successfully", status_code=302)
 
 

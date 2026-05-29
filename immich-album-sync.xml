@@ -85,7 +85,7 @@
     Target="SECRET_KEY"
     Default="change-me-please-use-a-long-random-string-here"
     Mode=""
-    Description="REQUIRED: Change this to a long random string used to sign session cookies. Using the default value is insecure. Generate one at: https://1password.com/password-generator/ (32+ characters). Changing this will log out all active sessions."
+    Description="REQUIRED: Change to a unique random string used to sign session cookies and encrypt stored API keys. Using the default value is INSECURE. Key length: minimum 16 characters | recommended 32–64 characters | maximum 128 characters (longer values provide no extra security). Generate a strong key at: https://1password.com/password-generator/ — select 32–64 characters, all character types. WARNING: changing this key after initial setup will invalidate all stored API keys and log out all active sessions — you will need to re-enter API keys for every sync job."
     Type="Variable"
     Display="always"
     Required="true"
