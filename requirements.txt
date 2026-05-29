@@ -8,3 +8,4 @@ bcrypt==4.2.1
 python-multipart==0.0.17
 itsdangerous==2.2.0
 aiofiles==24.1.0
+cryptography==42.0.8

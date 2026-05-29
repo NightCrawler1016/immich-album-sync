@@ -8,7 +8,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from .crypto import decrypt_secret
 from .immich_client import ImmichClient
+
+_SECRET_KEY = os.getenv("SECRET_KEY", "change-me-to-something-random-and-long")
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +82,10 @@ async def run_sync_job(
             except Exception:
                 pass
 
+    # Decrypt API keys — handles both Fernet-encrypted and legacy plaintext values
+    source_api_key = decrypt_secret(job.source_key, _SECRET_KEY)
+    dest_api_key = decrypt_secret(job.dest_key, _SECRET_KEY)
+
     job_cache_dir = Path(CACHE_BASE) / f"job_{job.id}"
     files_dir = job_cache_dir / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
@@ -89,7 +96,7 @@ async def run_sync_job(
     sync_log.info(f"   Dest   : {job.dest_url}  album='{job.dest_album_name}'")
 
     try:
-        source = ImmichClient(job.source_url, job.source_key)
+        source = ImmichClient(job.source_url, source_api_key)
 
         # ------------------------------------------------------------------ #
         # Step 1 — Locate the album
@@ -187,7 +194,7 @@ async def run_sync_job(
             log(f"Uploading {file_count} files to '{job.dest_album_name}'…")
             upload_result = await _run_immich_go_upload(
                 server=job.dest_url,
-                api_key=job.dest_key,
+                api_key=dest_api_key,
                 album_name=job.dest_album_name,
                 source_dir=str(files_dir),
                 sync_log=sync_log,

@@ -19,6 +19,9 @@
   <div class="mb-5 px-4 py-3 rounded-lg bg-red-900/50 border border-red-700 text-red-300 text-sm">{{ error }}</div>
   {% endif %}
 
+  <!-- Hidden job ID used for "test with stored key" when editing -->
+  <input type="hidden" id="job_id" value="{{ job.id if job else '' }}">
+
   <form method="post" action="{% if job %}/jobs/{{ job.id }}/edit{% else %}/jobs/new{% endif %}" class="space-y-6">
 
     <!-- Job name -->
@@ -36,7 +39,7 @@
 
     <!-- Source server -->
     <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
-      <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center justify-between mb-1">
         <h2 class="text-sm font-semibold text-gray-200">
           <span class="inline-flex items-center gap-1.5">
             <span class="w-2 h-2 rounded-full bg-sky-500 inline-block"></span>
@@ -46,9 +49,32 @@
         <button type="button" onclick="testConnection('source')"
                 id="testSourceBtn"
                 class="text-xs px-3 py-1.5 bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 rounded-lg border border-sky-500/20">
-          Test &amp; Load Albums
+          Test &amp; Check Permissions
         </button>
       </div>
+
+      <!-- Required permissions for source -->
+      <details class="mb-4 mt-2">
+        <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-400 select-none flex items-center gap-1">
+          <svg class="w-3 h-3 transition-transform details-arrow" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+          Required API key permissions for this server
+        </summary>
+        <div class="mt-2 rounded-lg border border-gray-700 bg-gray-800/50 p-3 space-y-2">
+          <div class="flex items-start gap-2">
+            <span class="mt-0.5 text-sky-400 text-xs font-mono bg-sky-500/10 px-1.5 py-0.5 rounded">album.read</span>
+            <span class="text-xs text-gray-400">Find the source album and list its photos</span>
+          </div>
+          <div class="flex items-start gap-2">
+            <span class="mt-0.5 text-sky-400 text-xs font-mono bg-sky-500/10 px-1.5 py-0.5 rounded">asset.read</span>
+            <span class="text-xs text-gray-400">Download original photo and video files (including Live Photos)</span>
+          </div>
+          <p class="text-xs text-gray-600 pt-1 border-t border-gray-700">
+            Tip: create a scoped API key with only these two permissions for least-privilege access.
+            <a href="https://immich.app/docs/features/api-keys" target="_blank" rel="noopener"
+               class="text-sky-500 hover:text-sky-400 ml-1">How to create an API key →</a>
+          </p>
+        </div>
+      </details>
 
       <div class="space-y-4">
         <div>
@@ -60,12 +86,24 @@
         </div>
 
         <div>
-          <label for="source_key" class="block text-sm font-medium text-gray-300 mb-1.5">API Key</label>
-          <input id="source_key" name="source_key" type="password" required
-                 value="{{ job.source_key if job else '' }}"
-                 placeholder="••••••••••••••••"
+          <label for="source_key" class="block text-sm font-medium text-gray-300 mb-1.5">
+            API Key
+            {% if job and has_source_key %}
+            <span class="ml-2 text-xs text-green-500 font-normal">● Key stored securely</span>
+            {% endif %}
+          </label>
+          {# SECURITY: Never render the actual key value into the HTML.
+             In edit mode, leave value="" — blank on submit keeps the existing key. #}
+          <input id="source_key" name="source_key" type="password"
+                 {% if not job %}required{% endif %}
+                 value=""
+                 placeholder="{% if job and has_source_key %}Leave blank to keep current key{% else %}Paste API key from Immich{% endif %}"
+                 autocomplete="new-password"
                  class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"/>
-          <p class="text-xs text-gray-500 mt-1">Generate in Immich → Account Settings → API Keys.</p>
+          <p class="text-xs text-gray-500 mt-1">
+            Generate in Immich → Account Settings → API Keys.
+            Keys are encrypted at rest using your configured SECRET_KEY.
+          </p>
         </div>
 
         <div>
@@ -80,14 +118,16 @@
               <option value="">— pick album —</option>
             </select>
           </div>
-          <p id="sourceTestResult" class="text-xs mt-1.5 hidden"></p>
         </div>
+
+        <!-- Source permission test results -->
+        <div id="sourcePermResults" class="hidden"></div>
       </div>
     </div>
 
     <!-- Destination server -->
     <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
-      <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center justify-between mb-1">
         <h2 class="text-sm font-semibold text-gray-200">
           <span class="inline-flex items-center gap-1.5">
             <span class="w-2 h-2 rounded-full bg-green-500 inline-block"></span>
@@ -97,9 +137,40 @@
         <button type="button" onclick="testConnection('dest')"
                 id="testDestBtn"
                 class="text-xs px-3 py-1.5 bg-green-500/10 hover:bg-green-500/20 text-green-400 rounded-lg border border-green-500/20">
-          Test Connection
+          Test &amp; Check Permissions
         </button>
       </div>
+
+      <!-- Required permissions for destination -->
+      <details class="mb-4 mt-2">
+        <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-400 select-none flex items-center gap-1">
+          <svg class="w-3 h-3 transition-transform details-arrow" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+          Required API key permissions for this server
+        </summary>
+        <div class="mt-2 rounded-lg border border-gray-700 bg-gray-800/50 p-3 space-y-2">
+          <div class="flex items-start gap-2">
+            <span class="mt-0.5 text-green-400 text-xs font-mono bg-green-500/10 px-1.5 py-0.5 rounded">album.read</span>
+            <span class="text-xs text-gray-400">Check whether the destination album already exists</span>
+          </div>
+          <div class="flex items-start gap-2">
+            <span class="mt-0.5 text-green-400 text-xs font-mono bg-green-500/10 px-1.5 py-0.5 rounded">album.write</span>
+            <span class="text-xs text-gray-400">Create the destination album if it doesn't exist; add synced photos to it</span>
+          </div>
+          <div class="flex items-start gap-2">
+            <span class="mt-0.5 text-green-400 text-xs font-mono bg-green-500/10 px-1.5 py-0.5 rounded">asset.read</span>
+            <span class="text-xs text-gray-400">Duplicate detection — check if photos already exist before uploading</span>
+          </div>
+          <div class="flex items-start gap-2">
+            <span class="mt-0.5 text-green-400 text-xs font-mono bg-green-500/10 px-1.5 py-0.5 rounded">asset.write</span>
+            <span class="text-xs text-gray-400">Upload new photos and videos to this server</span>
+          </div>
+          <p class="text-xs text-gray-600 pt-1 border-t border-gray-700">
+            For family sharing, consider creating a separate non-admin user on the destination and using their API key.
+            <a href="https://immich.app/docs/features/api-keys" target="_blank" rel="noopener"
+               class="text-sky-500 hover:text-sky-400 ml-1">How to create an API key →</a>
+          </p>
+        </div>
+      </details>
 
       <div class="space-y-4">
         <div>
@@ -111,11 +182,23 @@
         </div>
 
         <div>
-          <label for="dest_key" class="block text-sm font-medium text-gray-300 mb-1.5">API Key</label>
-          <input id="dest_key" name="dest_key" type="password" required
-                 value="{{ job.dest_key if job else '' }}"
-                 placeholder="••••••••••••••••"
+          <label for="dest_key" class="block text-sm font-medium text-gray-300 mb-1.5">
+            API Key
+            {% if job and has_dest_key %}
+            <span class="ml-2 text-xs text-green-500 font-normal">● Key stored securely</span>
+            {% endif %}
+          </label>
+          {# SECURITY: Never render the actual key value into the HTML. #}
+          <input id="dest_key" name="dest_key" type="password"
+                 {% if not job %}required{% endif %}
+                 value=""
+                 placeholder="{% if job and has_dest_key %}Leave blank to keep current key{% else %}Paste API key from Immich{% endif %}"
+                 autocomplete="new-password"
                  class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"/>
+          <p class="text-xs text-gray-500 mt-1">
+            Generate in Immich → Account Settings → API Keys.
+            Keys are encrypted at rest using your configured SECRET_KEY.
+          </p>
         </div>
 
         <div>
@@ -125,8 +208,10 @@
                  placeholder="Family Shared"
                  class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"/>
           <p class="text-xs text-gray-500 mt-1">Album will be created on the destination if it doesn't exist.</p>
-          <p id="destTestResult" class="text-xs mt-1.5 hidden"></p>
         </div>
+
+        <!-- Destination permission test results -->
+        <div id="destPermResults" class="hidden"></div>
       </div>
     </div>
 
@@ -134,7 +219,6 @@
     <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
       <h2 class="text-sm font-semibold text-gray-200 mb-4">Schedule</h2>
 
-      <!-- Quick presets -->
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
         <button type="button" onclick="setSchedule('0 */6 * * *')"
                 class="schedule-preset px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs rounded-lg border border-gray-700 text-center">
@@ -172,7 +256,6 @@
       <h2 class="text-sm font-semibold text-gray-200 mb-4">Behavior Options</h2>
       <div class="space-y-4">
 
-        <!-- Enabled toggle -->
         <label class="flex items-start gap-3 cursor-pointer group">
           <div class="pt-0.5">
             <input type="checkbox" name="enabled" value="on" id="enabled"
@@ -185,7 +268,6 @@
           </div>
         </label>
 
-        <!-- Cleanup cache -->
         <label class="flex items-start gap-3 cursor-pointer group">
           <div class="pt-0.5">
             <input type="checkbox" name="cleanup_cache" value="on" id="cleanup_cache"
@@ -194,11 +276,10 @@
           </div>
           <div>
             <p class="text-sm font-medium text-gray-200 group-hover:text-white">Clean up cache after upload</p>
-            <p class="text-xs text-gray-500">Delete downloaded originals from the cache directory once they're successfully uploaded. Saves disk space but re-downloads on next run.</p>
+            <p class="text-xs text-gray-500">Delete downloaded originals once uploaded. Saves disk space but re-downloads on next run.</p>
           </div>
         </label>
 
-        <!-- Delete sync -->
         <label class="flex items-start gap-3 cursor-pointer group">
           <div class="pt-0.5">
             <input type="checkbox" name="delete_sync" value="on" id="delete_sync"
@@ -210,7 +291,7 @@
               Mirror deletes
               <span class="ml-1 text-xs bg-yellow-900/50 text-yellow-400 px-1.5 py-0.5 rounded border border-yellow-700/50">Experimental</span>
             </p>
-            <p class="text-xs text-gray-500">If an asset is removed from the source album, remove it from the destination too. Not recommended for family sharing — use add-only mode instead.</p>
+            <p class="text-xs text-gray-500">If an asset is removed from the source album, remove it from the destination too.</p>
           </div>
         </label>
       </div>
@@ -234,6 +315,7 @@
 
 {% block scripts %}
 <script>
+  // ── Schedule presets ────────────────────────────────────────────────────────
   function setSchedule(value) {
     document.getElementById('schedule').value = value;
     updateScheduleHint();
@@ -242,80 +324,137 @@
   function updateScheduleHint() {
     const val = document.getElementById('schedule').value.trim();
     const hints = {
-      '0 */6 * * *': 'Every 6 hours (midnight, 6am, noon, 6pm UTC)',
+      '0 */6 * * *':  'Every 6 hours (midnight, 6am, noon, 6pm UTC)',
       '0 */12 * * *': 'Every 12 hours (midnight and noon UTC)',
-      '0 2 * * *': 'Daily at 2:00 AM UTC',
-      '0 * * * *': 'Every hour on the hour',
-      '0 0 * * *': 'Daily at midnight UTC',
+      '0 2 * * *':    'Daily at 2:00 AM UTC',
+      '0 * * * *':    'Every hour on the hour',
+      '0 0 * * *':    'Daily at midnight UTC',
       '*/30 * * * *': 'Every 30 minutes',
     };
-    const hint = document.getElementById('scheduleHint');
-    hint.textContent = hints[val] || '';
+    document.getElementById('scheduleHint').textContent = hints[val] || '';
   }
 
   document.getElementById('schedule').addEventListener('input', updateScheduleHint);
   updateScheduleHint();
 
+  // ── Permission test ─────────────────────────────────────────────────────────
   async function testConnection(side) {
-    const url = document.getElementById(side + '_url').value.trim();
-    const key = document.getElementById(side + '_key').value.trim();
-    const btn = document.getElementById('test' + (side === 'source' ? 'Source' : 'Dest') + 'Btn');
-    const result = document.getElementById(side + 'TestResult');
+    const url    = document.getElementById(side + '_url').value.trim();
+    const key    = document.getElementById(side + '_key').value.trim();
+    const jobId  = document.getElementById('job_id').value || null;
+    const btn    = document.getElementById('test' + (side === 'source' ? 'Source' : 'Dest') + 'Btn');
+    const panel  = document.getElementById(side + 'PermResults');
 
-    if (!url || !key) {
-      result.textContent = '⚠ Please fill in URL and API key first.';
-      result.className = 'text-xs mt-1.5 text-yellow-400';
-      result.classList.remove('hidden');
+    if (!url) {
+      showPermResults(panel, null, 'Enter the server URL first.');
       return;
     }
 
-    const orig = btn.textContent;
-    btn.textContent = 'Testing…';
+    // In edit mode with no new key entered, we'll ask the server to use the stored key.
+    // In new-job mode with no key, block the test.
+    if (!key && !jobId) {
+      showPermResults(panel, null, 'Enter an API key first.');
+      return;
+    }
+
+    const origLabel = btn.textContent;
+    btn.textContent = 'Checking…';
     btn.disabled = true;
+    panel.classList.add('hidden');
 
     try {
-      const res = await fetch('/api/test-connection', {
-        method: 'POST',
+      const body = { url, role: side };
+      if (key) {
+        body.api_key = key;
+      } else {
+        // Edit mode, blank key — let the server decrypt the stored key
+        body.api_key = '';
+        body.job_id  = parseInt(jobId, 10);
+      }
+
+      const res  = await fetch('/api/test-connection', {
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, api_key: key })
+        body:    JSON.stringify(body),
       });
       const data = await res.json();
 
-      if (data.success) {
-        result.textContent = `✓ Connected — ${data.albums.length} album(s) found`;
-        result.className = 'text-xs mt-1.5 text-green-400';
-        result.classList.remove('hidden');
-
-        if (side === 'source' && data.albums.length > 0) {
-          const sel = document.getElementById('sourceAlbumSelect');
-          sel.innerHTML = '<option value="">— pick album —</option>';
-          data.albums.forEach(a => {
-            const opt = document.createElement('option');
-            opt.value = a.name;
-            opt.textContent = `${a.name} (${a.asset_count} assets)`;
-            sel.appendChild(opt);
-          });
-          sel.classList.remove('hidden');
-        }
-      } else {
-        result.textContent = '✗ ' + (data.error || 'Connection failed');
-        result.className = 'text-xs mt-1.5 text-red-400';
-        result.classList.remove('hidden');
+      if (data.error && !data.permissions) {
+        showPermResults(panel, null, data.error);
+        return;
       }
-    } catch(e) {
-      result.textContent = '✗ Request error: ' + e.message;
-      result.className = 'text-xs mt-1.5 text-red-400';
-      result.classList.remove('hidden');
+
+      renderPermissions(panel, data.permissions || [], data.success);
+
+      // Populate album dropdown for source
+      if (side === 'source' && data.albums && data.albums.length > 0) {
+        const sel = document.getElementById('sourceAlbumSelect');
+        sel.innerHTML = '<option value="">— pick album —</option>';
+        data.albums.forEach(a => {
+          const opt = document.createElement('option');
+          opt.value = a.name;
+          opt.textContent = `${a.name} (${a.asset_count} assets)`;
+          sel.appendChild(opt);
+        });
+        sel.classList.remove('hidden');
+      }
+    } catch (e) {
+      showPermResults(panel, null, 'Request error: ' + e.message);
     } finally {
-      btn.textContent = orig;
+      btn.textContent = origLabel;
       btn.disabled = false;
     }
   }
 
-  function selectSourceAlbum(sel) {
-    if (sel.value) {
-      document.getElementById('source_album_name').value = sel.value;
-    }
+  function renderPermissions(panel, permissions, allOk) {
+    const rows = permissions.map(p => {
+      let icon, color;
+      if (p.ok === true)  { icon = '✓'; color = 'text-green-400'; }
+      else if (p.ok === false) { icon = '✗'; color = 'text-red-400'; }
+      else                { icon = 'ℹ'; color = 'text-sky-400'; }
+
+      return `
+        <div class="flex items-start gap-2 py-1.5 border-b border-gray-700 last:border-0">
+          <span class="font-bold ${color} w-4 flex-shrink-0 text-center">${icon}</span>
+          <div class="min-w-0">
+            <span class="text-xs font-mono ${color}">${escHtml(p.name)}</span>
+            <span class="text-xs text-gray-500 ml-1.5">— ${escHtml(p.desc)}</span>
+            ${p.detail ? `<p class="text-xs text-gray-600 mt-0.5">${escHtml(p.detail)}</p>` : ''}
+          </div>
+        </div>`;
+    }).join('');
+
+    const summary = allOk
+      ? `<div class="text-xs font-medium text-green-400 mb-2">✓ All required permissions confirmed</div>`
+      : `<div class="text-xs font-medium text-red-400 mb-2">✗ One or more required permissions are missing</div>`;
+
+    panel.innerHTML = `<div class="rounded-lg border border-gray-700 bg-gray-800/60 p-3">${summary}${rows}</div>`;
+    panel.classList.remove('hidden');
   }
+
+  function showPermResults(panel, ok, message) {
+    const color = ok === false ? 'text-red-400' : 'text-yellow-400';
+    panel.innerHTML = `<p class="text-xs ${color}">${escHtml(message)}</p>`;
+    panel.classList.remove('hidden');
+  }
+
+  function escHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  function selectSourceAlbum(sel) {
+    if (sel.value) document.getElementById('source_album_name').value = sel.value;
+  }
+
+  // Rotate the arrow on <details> open/close
+  document.querySelectorAll('details').forEach(d => {
+    d.addEventListener('toggle', () => {
+      const arrow = d.querySelector('.details-arrow');
+      if (arrow) arrow.style.transform = d.open ? 'rotate(90deg)' : '';
+    });
+  });
 </script>
 {% endblock %}

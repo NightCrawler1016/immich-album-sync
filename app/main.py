@@ -22,6 +22,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
+from .crypto import decrypt_secret as _decrypt_raw, encrypt_secret as _encrypt_raw
 from .database import get_db, init_db
 from .immich_client import ImmichClient
 from .models import Settings, SyncJob, SyncRun
@@ -63,6 +64,20 @@ def _verify_password(plain: str, hashed: str) -> bool:
         return _bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
     except Exception:
         return False
+
+
+# --------------------------------------------------------------------------- #
+# API key encryption helpers (wraps crypto.py with the app SECRET_KEY)
+# --------------------------------------------------------------------------- #
+
+def _encrypt_key(plain: str) -> str:
+    """Encrypt an API key for database storage."""
+    return _encrypt_raw(plain, SECRET_KEY)
+
+
+def _decrypt_key(stored: str) -> str:
+    """Decrypt a stored API key. Falls back gracefully for legacy plaintext."""
+    return _decrypt_raw(stored, SECRET_KEY)
 
 
 # --------------------------------------------------------------------------- #
@@ -249,7 +264,13 @@ async def job_new_get(request: Request):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
     return templates.TemplateResponse(
-        "job_form.html", {"request": request, "job": None, "error": None}
+        "job_form.html", {
+            "request": request,
+            "job": None,
+            "has_source_key": False,
+            "has_dest_key": False,
+            "error": None,
+        }
     )
 
 
@@ -275,10 +296,10 @@ async def job_new_post(
     job = SyncJob(
         name=name.strip(),
         source_url=source_url.strip().rstrip("/"),
-        source_key=source_key.strip(),
+        source_key=_encrypt_key(source_key.strip()),
         source_album_name=source_album_name.strip(),
         dest_url=dest_url.strip().rstrip("/"),
-        dest_key=dest_key.strip(),
+        dest_key=_encrypt_key(dest_key.strip()),
         dest_album_name=dest_album_name.strip(),
         schedule=schedule.strip(),
         delete_sync=delete_sync == "on",
@@ -312,8 +333,15 @@ async def job_edit_get(request: Request, job_id: int, db: Session = Depends(get_
     job = db.query(SyncJob).filter(SyncJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # Never send actual key values to the template — they must not appear in HTML
     return templates.TemplateResponse(
-        "job_form.html", {"request": request, "job": job, "error": None}
+        "job_form.html", {
+            "request": request,
+            "job": job,
+            "has_source_key": bool(job.source_key),
+            "has_dest_key": bool(job.dest_key),
+            "error": None,
+        }
     )
 
 
@@ -323,10 +351,10 @@ async def job_edit_post(
     job_id: int,
     name: str = Form(...),
     source_url: str = Form(...),
-    source_key: str = Form(...),
+    source_key: str = Form(""),   # blank = keep existing encrypted key
     source_album_name: str = Form(...),
     dest_url: str = Form(...),
-    dest_key: str = Form(...),
+    dest_key: str = Form(""),     # blank = keep existing encrypted key
     dest_album_name: str = Form(...),
     schedule: str = Form("0 */6 * * *"),
     delete_sync: Optional[str] = Form(None),
@@ -343,10 +371,13 @@ async def job_edit_post(
 
     job.name = name.strip()
     job.source_url = source_url.strip().rstrip("/")
-    job.source_key = source_key.strip()
+    # Only replace the key if a new value was provided — blank means "keep existing"
+    if source_key.strip():
+        job.source_key = _encrypt_key(source_key.strip())
     job.source_album_name = source_album_name.strip()
     job.dest_url = dest_url.strip().rstrip("/")
-    job.dest_key = dest_key.strip()
+    if dest_key.strip():
+        job.dest_key = _encrypt_key(dest_key.strip())
     job.dest_album_name = dest_album_name.strip()
     job.schedule = schedule.strip()
     job.delete_sync = delete_sync == "on"
@@ -705,7 +736,14 @@ def _upsert_setting(db: Session, key: str, value: str):
 # --------------------------------------------------------------------------- #
 
 @app.post("/api/test-connection")
-async def api_test_connection(request: Request):
+async def api_test_connection(request: Request, db: Session = Depends(get_db)):
+    """
+    Test connectivity and check required API key permissions.
+
+    Body: { url, api_key, role: "source"|"dest", job_id? }
+    When api_key is blank and job_id is provided, the stored (encrypted) key
+    for that job is used so the form never needs to re-expose the key value.
+    """
     if not _logged_in(request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
@@ -716,28 +754,45 @@ async def api_test_connection(request: Request):
 
     url = (body.get("url") or "").strip().rstrip("/")
     api_key = (body.get("api_key") or "").strip()
+    role = (body.get("role") or "source").strip()      # "source" or "dest"
+    job_id = body.get("job_id")                        # optional — use stored key
+
+    # If the form left the key blank (edit mode), use the stored encrypted key
+    if not api_key and job_id:
+        try:
+            job = db.query(SyncJob).filter(SyncJob.id == int(job_id)).first()
+            if job:
+                stored = job.source_key if role == "source" else job.dest_key
+                api_key = _decrypt_key(stored)
+        except Exception:
+            pass
 
     if not url or not api_key:
-        return JSONResponse({"error": "url and api_key are required"}, status_code=400)
+        return JSONResponse(
+            {"error": "URL and API key are required. Enter a key or save the job first."},
+            status_code=400,
+        )
 
     try:
         client = ImmichClient(url, api_key)
-        info = await client.test_connection()
-        albums = await client.get_albums()
-        return JSONResponse(
-            {
-                "success": True,
-                "server_info": info,
-                "albums": [
-                    {
-                        "id": a["id"],
-                        "name": a.get("albumName", ""),
-                        "asset_count": a.get("assetCount", 0),
-                    }
-                    for a in albums
-                ],
-            }
+        permissions, albums = await client.check_permissions(role)
+
+        all_required_ok = all(
+            p["ok"] is not False for p in permissions
         )
+
+        return JSONResponse({
+            "success": all_required_ok,
+            "permissions": permissions,
+            "albums": [
+                {
+                    "id": a["id"],
+                    "name": a.get("albumName", ""),
+                    "asset_count": a.get("assetCount", 0),
+                }
+                for a in albums
+            ],
+        })
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
