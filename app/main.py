@@ -1,7 +1,11 @@
 import asyncio
+import io
 import json
 import logging
 import os
+import subprocess
+import sys
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -525,6 +529,107 @@ async def logs_stream(request: Request):
         generator(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Logs — support bundle download
+# --------------------------------------------------------------------------- #
+
+@app.get("/logs/support-bundle")
+async def download_support_bundle(request: Request, db: Session = Depends(get_db)):
+    """Build and return a ZIP containing logs, sanitized job configs, run history, and system info."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=302)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+
+        # 1. Sync log file
+        log_file = Path(LOG_PATH)
+        if log_file.exists():
+            try:
+                zf.write(log_file, "sync.log")
+            except Exception as exc:
+                zf.writestr("sync.log", f"(error reading log: {exc})\n")
+        else:
+            zf.writestr("sync.log", "(no log file found)\n")
+
+        # 2. Job configurations — API keys redacted
+        jobs = db.query(SyncJob).order_by(SyncJob.created_at).all()
+        jobs_info = []
+        for job in jobs:
+            jobs_info.append({
+                "id": job.id,
+                "name": job.name,
+                "source_url": job.source_url,
+                "source_key": "[redacted]",
+                "source_album_name": job.source_album_name,
+                "dest_url": job.dest_url,
+                "dest_key": "[redacted]",
+                "dest_album_name": job.dest_album_name,
+                "schedule": job.schedule,
+                "enabled": job.enabled,
+                "delete_sync": job.delete_sync,
+                "cleanup_cache": job.cleanup_cache,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+            })
+        zf.writestr("jobs.json", json.dumps(jobs_info, indent=2))
+
+        # 3. Last 100 sync run records
+        runs = (
+            db.query(SyncRun)
+            .order_by(SyncRun.started_at.desc())
+            .limit(100)
+            .all()
+        )
+        runs_info = []
+        for run in runs:
+            runs_info.append({
+                "id": run.id,
+                "job_id": run.job_id,
+                "job_name": run.job.name if run.job else "Unknown",
+                "status": run.status,
+                "started_at": run.started_at.isoformat() if run.started_at else None,
+                "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+                "assets_found": run.assets_found,
+                "assets_downloaded": run.assets_downloaded,
+                "assets_uploaded": run.assets_uploaded,
+                "assets_skipped": run.assets_skipped,
+                "assets_failed": run.assets_failed,
+                "error_message": run.error_message,
+            })
+        zf.writestr("sync_runs.json", json.dumps(runs_info, indent=2))
+
+        # 4. System info
+        immich_go_ver = "unknown"
+        try:
+            result = subprocess.run(
+                ["immich-go", "--version"], capture_output=True, text=True, timeout=5
+            )
+            immich_go_ver = (result.stdout or result.stderr or "").strip().splitlines()[0]
+        except Exception:
+            pass
+
+        system_info = {
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "python_version": sys.version,
+            "immich_go_version": immich_go_ver,
+            "log_path": LOG_PATH,
+            "db_path": os.getenv("DB_PATH", "/app/appdata/config.db"),
+            "cache_path": os.getenv("CACHE_PATH", "/app/appdata/cache"),
+            "tz": os.getenv("TZ", "(not set)"),
+        }
+        zf.writestr("system_info.json", json.dumps(system_info, indent=2))
+
+    buf.seek(0)
+    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    filename = f"immich-album-sync-support-{timestamp}.zip"
+
+    return StreamingResponse(
+        iter([buf.read()]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

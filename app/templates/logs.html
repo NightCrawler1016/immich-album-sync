@@ -5,18 +5,43 @@
 <div class="p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto h-full flex flex-col">
 
   <!-- Header -->
-  <div class="flex items-center justify-between mb-4 flex-shrink-0">
+  <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4 flex-shrink-0">
     <div>
       <h1 class="text-xl font-bold text-white">Live Logs</h1>
       <p class="text-sm text-gray-400 mt-0.5">Real-time sync activity stream</p>
     </div>
-    <div class="flex items-center gap-2">
+    <div class="flex flex-wrap items-center gap-2">
       <!-- Connection indicator -->
-      <span id="statusDot" class="flex items-center gap-1.5 text-xs text-gray-400">
+      <span id="statusDot" class="flex items-center gap-1.5 text-xs text-gray-400 mr-1">
         <span class="w-2 h-2 rounded-full bg-yellow-500 animate-pulse" id="statusDotColor"></span>
         <span id="statusText">Connecting…</span>
       </span>
-      <button onclick="clearLog()" class="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg border border-gray-700">Clear</button>
+
+      <button onclick="clearLog()"
+              class="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg border border-gray-700">
+        Clear
+      </button>
+
+      <button onclick="copyLog()" id="copyBtn"
+              class="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg border border-gray-700 flex items-center gap-1.5">
+        <!-- clipboard icon -->
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round"
+                d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10" />
+        </svg>
+        <span id="copyBtnLabel">Copy</span>
+      </button>
+
+      <a href="/logs/support-bundle"
+         class="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg border border-gray-700 flex items-center gap-1.5 no-underline">
+        <!-- download icon -->
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round"
+                d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3" />
+        </svg>
+        Support Bundle
+      </a>
+
       <button onclick="toggleScroll()" id="scrollBtn"
               class="text-xs px-3 py-1.5 bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 rounded-lg border border-sky-500/20">
         Auto-scroll: ON
@@ -96,6 +121,46 @@ function appendLine(text) {
 
 function clearLog() {
   logOutput.innerHTML = '';
+}
+
+function copyLog() {
+  // Collect plain text from every child element, preserving line breaks
+  const lines = Array.from(logOutput.children).map(el => el.textContent);
+  const text = lines.join('\n');
+
+  const btn = document.getElementById('copyBtn');
+  const label = document.getElementById('copyBtnLabel');
+
+  if (!navigator.clipboard) {
+    // Fallback for non-HTTPS or older browsers
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+    showCopiedFeedback(btn, label);
+    return;
+  }
+
+  navigator.clipboard.writeText(text).then(() => {
+    showCopiedFeedback(btn, label);
+  }).catch(() => {
+    label.textContent = 'Failed';
+    setTimeout(() => { label.textContent = 'Copy'; }, 2000);
+  });
+}
+
+function showCopiedFeedback(btn, label) {
+  label.textContent = 'Copied ✓';
+  btn.classList.replace('text-gray-300', 'text-green-400');
+  btn.classList.replace('border-gray-700', 'border-green-500/40');
+  setTimeout(() => {
+    label.textContent = 'Copy';
+    btn.classList.replace('text-green-400', 'text-gray-300');
+    btn.classList.replace('border-green-500/40', 'border-gray-700');
+  }, 2000);
 }
 
 function toggleScroll() {
