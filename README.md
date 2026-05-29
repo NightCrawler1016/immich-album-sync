@@ -1,6 +1,6 @@
 # Immich Album Sync
 
-A Docker container with a **web UI** for performing one-way album syncs between two <a href="https://immich.app" target="_blank" rel="noopener noreferrer">Immich</a> servers. Built for Unraid but works on any Docker host.
+A Docker container with a **web UI** for performing one-way album syncs between two [Immich](https://immich.app) servers. Built for Unraid but works on any Docker host.
 
 ```
 Immich A (private)  ──────────────▶  Immich B (public/family)
@@ -89,7 +89,7 @@ All Immich API keys entered in sync job forms are encrypted before being stored 
 | **Recommended length** | **32–64 characters** |
 | Maximum length | 128 characters (longer provides no additional benefit) |
 
-Generate a strong key: <a href="https://1password.com/password-generator/" target="_blank" rel="noopener noreferrer">1Password Generator</a> — select 32–64 characters with all character types.
+Generate a strong key: [1Password Generator](https://1password.com/password-generator/) — select 32–64 characters with all character types.
 
 > **Important:** Changing `SECRET_KEY` after the initial setup will **invalidate all stored API keys** (they were encrypted with the old key) and log out all active sessions. You will need to re-enter API keys for every sync job.
 
@@ -185,7 +185,7 @@ services:
 | Source (Immich A) | `album.read`, `asset.read` |
 | Destination (Immich B) | `album.read`, `album.write`, `asset.read`, `asset.write` |
 
-See <a href="https://docs.immich.app/features/command-line-interface/#obtain-the-api-key" target="_blank" rel="noopener noreferrer">Immich API Key documentation</a> for how to create keys with specific permissions.
+See [Immich API Key documentation](https://docs.immich.app/features/command-line-interface/#obtain-the-api-key) for how to create keys with specific permissions.
 
 ---
 
@@ -237,7 +237,7 @@ With the default 10 GB limit, syncs under 10 GB behave exactly as before (single
 1. At the scheduled time, the sync engine connects to **Immich A** via its REST API
 2. Finds the configured source album by name and lists all assets (including Live Photo `.MOV` companions)
 3. Downloads original files to the local cache in rolling batches — once a batch reaches `BATCH_SIZE_MB` (default 10 GB) or `BATCH_FILE_COUNT`, it is immediately uploaded and cleared before the next batch begins
-4. Uploads each batch to **Immich B** using <a href="https://github.com/simulot/immich-go" target="_blank" rel="noopener noreferrer"><code>immich-go</code></a> (v0.31.0), which performs duplicate detection on the destination
+4. Uploads each batch to **Immich B** using [`immich-go`](https://github.com/simulot/immich-go) (v0.31.0), which performs duplicate detection on the destination
 5. Logs all activity to `/app/appdata/logs/sync.log`, viewable live in the browser
 
 Files already present in the cache are skipped on re-download. `immich-go` skips files already present on the destination. For albums under 10 GB the engine processes everything as a single batch — identical to a traditional download-then-upload flow.
@@ -305,7 +305,7 @@ In the **Live Logs** page, click **Download Support Bundle** to get a ZIP contai
 
 ## Notes on immich-go
 
-This container pins <a href="https://github.com/simulot/immich-go" target="_blank" rel="noopener noreferrer"><code>immich-go</code></a> to **v0.31.0** for stability. The upload command used internally:
+This container pins [`immich-go`](https://github.com/simulot/immich-go) to **v0.31.0** for stability. The upload command used internally:
 
 ```bash
 immich-go upload from-folder \
@@ -325,13 +325,13 @@ This project is built on top of several excellent open-source tools — credit g
 
 | Project | Author | Role in this project |
 |---|---|---|
-| <a href="https://github.com/simulot/immich-go" target="_blank" rel="noopener noreferrer">immich-go</a> | <a href="https://github.com/simulot" target="_blank" rel="noopener noreferrer">simulot</a> | Upload engine — handles duplicate detection and album creation on the destination server |
-| <a href="https://github.com/immich-app/immich" target="_blank" rel="noopener noreferrer">Immich</a> | <a href="https://github.com/immich-app" target="_blank" rel="noopener noreferrer">Immich Team</a> | The self-hosted photo platform this tool syncs between |
-| <a href="https://fastapi.tiangolo.com" target="_blank" rel="noopener noreferrer">FastAPI</a> | Sebastián Ramírez | Web framework powering the UI and REST API |
-| <a href="https://github.com/agronholm/apscheduler" target="_blank" rel="noopener noreferrer">APScheduler</a> | Alex Grönholm | Cron-based scheduling for automated sync jobs |
-| <a href="https://www.sqlalchemy.org" target="_blank" rel="noopener noreferrer">SQLAlchemy</a> | Mike Bayer | ORM for SQLite job/run storage |
-| <a href="https://tailwindcss.com" target="_blank" rel="noopener noreferrer">Tailwind CSS</a> | Tailwind Labs | UI styling |
-| <a href="https://www.python-httpx.org" target="_blank" rel="noopener noreferrer">httpx</a> | Encode | Async HTTP client used to talk to Immich APIs |
+| [immich-go](https://github.com/simulot/immich-go) | [simulot](https://github.com/simulot) | Upload engine — handles duplicate detection and album creation on the destination server |
+| [Immich](https://github.com/immich-app/immich) | [Immich Team](https://github.com/immich-app) | The self-hosted photo platform this tool syncs between |
+| [FastAPI](https://fastapi.tiangolo.com) | Sebastián Ramírez | Web framework powering the UI and REST API |
+| [APScheduler](https://github.com/agronholm/apscheduler) | Alex Grönholm | Cron-based scheduling for automated sync jobs |
+| [SQLAlchemy](https://www.sqlalchemy.org) | Mike Bayer | ORM for SQLite job/run storage |
+| [Tailwind CSS](https://tailwindcss.com) | Tailwind Labs | UI styling |
+| [httpx](https://www.python-httpx.org) | Encode | Async HTTP client used to talk to Immich APIs |
 
 A big thank you to the **immich-go** project in particular — it does the heavy lifting of uploading files with smart duplicate detection so this tool doesn't have to reinvent that wheel.
 
