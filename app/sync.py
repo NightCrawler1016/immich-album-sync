@@ -283,10 +283,18 @@ async def _run_immich_go_upload(
                 if text:
                     sync_log.info(f"   [go]   {text}")
                     stdout_lines.append(text)
-                    # Try to parse upload count from progress lines
-                    nums = re.findall(r"\d+", text)
-                    if "upload" in text.lower() and nums:
-                        uploaded_count = max(uploaded_count, int(nums[0]))
+
+                    # Parse the final summary report lines (most accurate).
+                    # "added to album : 3"  — preferred: assets actually in the album
+                    m = re.search(r"added to album\s*:\s*(\d+)", text, re.IGNORECASE)
+                    if m:
+                        uploaded_count = int(m.group(1))
+                        continue
+
+                    # "uploaded successfully : 1"  — fallback if no album line appears
+                    m = re.search(r"uploaded successfully\s*:\s*(\d+)", text, re.IGNORECASE)
+                    if m:
+                        uploaded_count = max(uploaded_count, int(m.group(1)))
 
         async def read_stderr():
             async for line in proc.stderr:
