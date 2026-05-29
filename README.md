@@ -185,7 +185,7 @@ services:
 | Source (Immich A) | `album.read`, `asset.read` |
 | Destination (Immich B) | `album.read`, `album.write`, `asset.read`, `asset.write` |
 
-See [Immich API Key documentation](https://immich.app/docs/features/api-keys) for how to create keys with specific permissions.
+See [Immich API Key documentation](https://docs.immich.app/features/command-line-interface/#obtain-the-api-key) for how to create keys with specific permissions.
 
 ---
 
