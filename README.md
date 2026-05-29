@@ -319,6 +319,24 @@ immich-go upload from-folder \
 
 ---
 
+## Credits & Acknowledgements
+
+This project is built on top of several excellent open-source tools — credit goes to their authors:
+
+| Project | Author | Role in this project |
+|---|---|---|
+| [immich-go](https://github.com/simulot/immich-go) | [simulot](https://github.com/simulot) | Upload engine — handles duplicate detection and album creation on the destination server |
+| [Immich](https://github.com/immich-app/immich) | [Immich Team](https://github.com/immich-app) | The self-hosted photo platform this tool syncs between |
+| [FastAPI](https://fastapi.tiangolo.com) | Sebastián Ramírez | Web framework powering the UI and REST API |
+| [APScheduler](https://github.com/agronholm/apscheduler) | Alex Grönholm | Cron-based scheduling for automated sync jobs |
+| [SQLAlchemy](https://www.sqlalchemy.org) | Mike Bayer | ORM for SQLite job/run storage |
+| [Tailwind CSS](https://tailwindcss.com) | Tailwind Labs | UI styling |
+| [httpx](https://www.python-httpx.org) | Encode | Async HTTP client used to talk to Immich APIs |
+
+A big thank you to the **immich-go** project in particular — it does the heavy lifting of uploading files with smart duplicate detection so this tool doesn't have to reinvent that wheel.
+
+---
+
 ## License
 
 MIT
