@@ -1,6 +1,22 @@
-# Immich Album Sync
+<div align="center">
 
-A Docker container with a **web UI** for performing one-way album syncs between two [Immich](https://immich.app) servers. Built for Unraid but works on any Docker host.
+<img src="icon.png" alt="Immich Album Sync" width="150" height="150" />
+
+<h1>Immich Album Sync</h1>
+
+<p>
+  <strong>One-way album sync between two <a href="https://immich.app">Immich</a> servers — with a web UI.</strong><br/>
+  Built for Unraid, runs on any Docker host.
+</p>
+
+<p>
+  <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" />
+  <img src="https://img.shields.io/badge/Unraid-Community%20App-f15a2c" alt="Unraid Community App" />
+  <img src="https://img.shields.io/badge/Docker-ghcr.io-2496ed?logo=docker&logoColor=white" alt="Docker image on GHCR" />
+  <img src="https://img.shields.io/badge/powered%20by-immich--go-0ea5e9" alt="Powered by immich-go" />
+</p>
+
+</div>
 
 ```
 Immich A (private)  ──────────────▶  Immich B (public/family)
