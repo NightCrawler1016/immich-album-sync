@@ -182,8 +182,10 @@ services:
 
 | Server | Required Permissions |
 |---|---|
-| Source (Immich A) | `album.read`, `asset.read` |
+| Source (Immich A) | `album.read`, `asset.read`, `asset.download` |
 | Destination (Immich B) | `album.read`, `album.write`, `asset.read`, `asset.write` |
+
+> **Note:** On the **source** server, `asset.download` is a separate scope from `asset.read` — it is what actually permits downloading original files. A key with only `album.read` + `asset.read` will pass metadata checks but fail every file download with `403 Forbidden`. `user.read` is **not** required.
 
 See [Immich API Key documentation](https://docs.immich.app/features/command-line-interface/#obtain-the-api-key) for how to create keys with specific permissions.
 
