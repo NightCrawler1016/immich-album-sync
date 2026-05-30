@@ -103,6 +103,28 @@
     Mask="false">America/New_York</Config>
 
   <Config
+    Name="PUID"
+    Target="PUID"
+    Default="99"
+    Mode=""
+    Description="User ID the app process runs as (the container no longer runs as root). The default 99 is Unraid's 'nobody' user, which matches standard appdata ownership — leave it unless your appdata/cache is owned by a different user. If the container logs permission errors writing to appdata, set this to the owner UID of your appdata share."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false">99</Config>
+
+  <Config
+    Name="PGID"
+    Target="PGID"
+    Default="100"
+    Mode=""
+    Description="Group ID the app process runs as. The default 100 is Unraid's 'users' group, which matches standard appdata ownership. Change only if your appdata/cache is owned by a different group."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false">100</Config>
+
+  <Config
     Name="Cleanup Cache After Upload"
     Target="CLEANUP_CACHE"
     Default="false"

@@ -35,6 +35,22 @@ RUN set -ex && \
     rm -rf /tmp/immich-go.tar.gz /tmp/immich-go-extract && \
     immich-go --version
 
+# Install gosu for safe privilege de-escalation in the entrypoint.
+# The container starts as root only long enough to fix data-dir ownership,
+# then drops to an unprivileged PUID:PGID for the actual app process.
+ENV GOSU_VERSION=1.17
+RUN set -ex && \
+    ARCH=$(uname -m) && \
+    case "$ARCH" in \
+        x86_64)  GOSU_ARCH="amd64" ;; \
+        aarch64) GOSU_ARCH="arm64" ;; \
+        *)       GOSU_ARCH="amd64" ;; \
+    esac && \
+    curl -fsSL "https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${GOSU_ARCH}" \
+        -o /usr/local/bin/gosu && \
+    chmod +x /usr/local/bin/gosu && \
+    gosu --version
+
 WORKDIR /app
 
 # Install Python dependencies

@@ -46,6 +46,23 @@ def _get_sync_file_logger() -> logging.Logger:
     return sync_logger
 
 
+def _safe_filename(name: Optional[str], fallback: str) -> str:
+    """Reduce a server-supplied filename to a safe basename for the cache dir.
+
+    The *source* Immich server controls ``originalFileName``, so it must never
+    be trusted as a path. Stripping directory components (on both POSIX and
+    Windows separators) and rejecting ``.``/``..`` keeps every download inside
+    the job's cache directory — without this, a malicious or compromised source
+    could return e.g. ``../../app/main.py`` and write outside the cache.
+    """
+    if not name:
+        return fallback
+    base = os.path.basename(str(name).replace("\\", "/")).strip()
+    if not base or base in (".", ".."):
+        return fallback
+    return base
+
+
 def _clear_dir_contents(path: Path) -> None:
     """Delete everything inside *path* while keeping the directory itself.
 
@@ -158,7 +175,7 @@ async def run_sync_job(
                 continue
             seen_ids.add(asset_id)
 
-            filename = asset.get("originalFileName") or f"{asset_id}.bin"
+            filename = _safe_filename(asset.get("originalFileName"), f"{asset_id}.bin")
             to_download.append({"id": asset_id, "filename": filename})
 
             # Fetch Live Photo companion (.MOV paired with .HEIC)
@@ -167,8 +184,10 @@ async def run_sync_job(
                 seen_ids.add(live_video_id)
                 try:
                     video_info = await source.get_asset_info(live_video_id)
-                    video_filename = video_info.get("originalFileName") or \
-                        f"{Path(filename).stem}.MOV"
+                    video_filename = _safe_filename(
+                        video_info.get("originalFileName"),
+                        f"{Path(filename).stem}.MOV",
+                    )
                     to_download.append({
                         "id": live_video_id,
                         "filename": video_filename,
