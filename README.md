@@ -39,6 +39,41 @@ Immich A (private)  ──────────────▶  Immich B (pub
 
 ---
 
+## Screenshots
+
+<div align="center">
+
+<img src="screenshots/1-dashboard.png" alt="Dashboard" width="900" />
+
+<sub><b>Dashboard</b> — job overview, status tiles, and recent run history</sub>
+
+</div>
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="screenshots/2-sync-jobs.png" alt="Sync Jobs" /><br/>
+      <sub><b>Sync Jobs</b> — manage all album sync rules at a glance</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="screenshots/3-edit-sync-jobs.png" alt="Edit Job" /><br/>
+      <sub><b>Edit Job</b> — servers, API keys, schedule &amp; behavior</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="screenshots/4-live-logs.png" alt="Live Logs" /><br/>
+      <sub><b>Live Logs</b> — real-time, color-coded sync activity stream</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="screenshots/5-settings.png" alt="Settings" /><br/>
+      <sub><b>Settings</b> — credentials, account, and app info</sub>
+    </td>
+  </tr>
+</table>
+
+---
+
 ## Quick Start (Unraid)
 
 ### Option A — Community Applications XML Template
