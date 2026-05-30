@@ -18,6 +18,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 import bcrypt as _bcrypt
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
@@ -49,6 +50,12 @@ app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=86400)  # 2
 # Templates directory is relative to the Python package root
 _template_dir = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(_template_dir))
+
+# Static assets (app icon / favicon / logo). Served publicly with no auth so
+# the icon renders on the login and change-password pages too.
+_static_dir = Path(__file__).parent / "static"
+_static_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
 
 # Jinja2 global helpers
 templates.env.globals["now"] = datetime.utcnow
