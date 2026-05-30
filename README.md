@@ -49,28 +49,39 @@ Immich A (private)  ──────────────▶  Immich B (pub
 
 </div>
 
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <a href="screenshots/2-sync-jobs.png"><img src="screenshots/2-sync-jobs.png" alt="Sync Jobs" /></a><br/>
-      <sub><b>Sync Jobs</b> — manage all album sync rules at a glance</sub>
-    </td>
-    <td align="center" width="50%">
-      <a href="screenshots/3-edit-sync-jobs.png"><img src="screenshots/3-edit-sync-jobs.png" alt="Edit Job" /></a><br/>
-      <sub><b>Edit Job</b> — servers, API keys, schedule &amp; behavior</sub>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="50%">
-      <a href="screenshots/4-live-logs.png"><img src="screenshots/4-live-logs.png" alt="Live Logs" /></a><br/>
-      <sub><b>Live Logs</b> — real-time, color-coded sync activity stream</sub>
-    </td>
-    <td align="center" width="50%">
-      <a href="screenshots/5-settings.png"><img src="screenshots/5-settings.png" alt="Settings" /></a><br/>
-      <sub><b>Settings</b> — credentials, account, and app info</sub>
-    </td>
-  </tr>
-</table>
+<br/>
+
+<details>
+<summary>🔁 <b>Sync Jobs</b> — manage all album sync rules at a glance</summary>
+<br/>
+<div align="center">
+  <a href="screenshots/2-sync-jobs.png"><img src="screenshots/2-sync-jobs.png" alt="Sync Jobs" width="900" /></a>
+</div>
+</details>
+
+<details>
+<summary>✏️ <b>Edit Job</b> — servers, API keys, schedule &amp; behavior</summary>
+<br/>
+<div align="center">
+  <a href="screenshots/3-edit-sync-jobs.png"><img src="screenshots/3-edit-sync-jobs.png" alt="Edit Job" width="700" /></a>
+</div>
+</details>
+
+<details>
+<summary>📜 <b>Live Logs</b> — real-time, color-coded sync activity stream</summary>
+<br/>
+<div align="center">
+  <a href="screenshots/4-live-logs.png"><img src="screenshots/4-live-logs.png" alt="Live Logs" width="900" /></a>
+</div>
+</details>
+
+<details>
+<summary>⚙️ <b>Settings</b> — credentials, account, and app info</summary>
+<br/>
+<div align="center">
+  <a href="screenshots/5-settings.png"><img src="screenshots/5-settings.png" alt="Settings" width="900" /></a>
+</div>
+</details>
 
 ---
 
