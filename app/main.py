@@ -3,13 +3,17 @@ import io
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
+import httpx
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import (
     HTMLResponse,
@@ -46,6 +50,36 @@ SECRET_KEY = os.getenv("SECRET_KEY", "change-me-to-something-random-and-long")
 
 app = FastAPI(title="Immich Album Sync", docs_url=None, redoc_url=None)
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=86400)  # 24 h
+
+# --------------------------------------------------------------------------- #
+# CSRF protection
+#
+# State-changing requests must originate from this app's own pages. We compare
+# the browser-set Origin (falling back to Referer) host against the Host header
+# and reject cross-site requests. Modern browsers always send Origin on POST,
+# so legitimate same-origin form posts and fetch() calls pass; a malicious
+# third-party page cannot forge a matching Origin. This complements the
+# SameSite=Lax session cookie set above (which already blocks cross-site
+# cookie-bearing POSTs) without needing a token in every form.
+# --------------------------------------------------------------------------- #
+_CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
+
+
+@app.middleware("http")
+async def csrf_protect(request: Request, call_next):
+    if request.method not in _CSRF_SAFE_METHODS:
+        host = request.headers.get("host", "")
+        source = request.headers.get("origin") or request.headers.get("referer")
+        if source:
+            netloc = urlparse(source).netloc
+            # Block only on a clear cross-origin mismatch. When neither header
+            # is present (rare for browsers) the SameSite cookie is the backstop.
+            if netloc and netloc != host:
+                return JSONResponse(
+                    {"error": "CSRF validation failed — request origin mismatch."},
+                    status_code=403,
+                )
+    return await call_next(request)
 
 # Templates directory is relative to the Python package root
 _template_dir = Path(__file__).parent / "templates"
@@ -147,6 +181,51 @@ async def shutdown():
 # Auth helpers
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Login rate limiting (in-memory, per client IP)
+#
+# Slows credential brute-forcing: after too many failures in a window the IP is
+# locked out for a cooldown. State is in-memory (resets on restart), which is
+# fine for a single-admin app. Behind a reverse proxy all clients may share the
+# proxy IP — the thresholds are lenient enough that a user who knows their
+# password will not trip them.
+# --------------------------------------------------------------------------- #
+_LOGIN_MAX_FAILS = 10      # failures within the window …
+_LOGIN_WINDOW = 900        # … measured over 15 minutes …
+_LOGIN_LOCKOUT = 300       # … trigger a 5-minute lockout.
+_login_state: dict[str, dict] = {}  # ip -> {"fails", "first", "until"}
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _login_lock_remaining(ip: str) -> int:
+    """Seconds remaining on an active lockout for *ip*, or 0 if not locked."""
+    rec = _login_state.get(ip)
+    if not rec:
+        return 0
+    remaining = int(rec.get("until", 0) - time.monotonic())
+    return remaining if remaining > 0 else 0
+
+
+def _record_login_failure(ip: str) -> None:
+    now = time.monotonic()
+    rec = _login_state.get(ip)
+    if not rec or now - rec["first"] > _LOGIN_WINDOW:
+        rec = {"fails": 0, "first": now, "until": 0}
+    rec["fails"] += 1
+    if rec["fails"] >= _LOGIN_MAX_FAILS:
+        rec["until"] = now + _LOGIN_LOCKOUT
+        rec["fails"] = 0
+        rec["first"] = now
+    _login_state[ip] = rec
+
+
+def _record_login_success(ip: str) -> None:
+    _login_state.pop(ip, None)
+
+
 def _get_admin_creds(db: Session) -> tuple[str, Optional[str]]:
     u = db.query(Settings).filter(Settings.key == "admin_username").first()
     p = db.query(Settings).filter(Settings.key == "admin_password_hash").first()
@@ -190,8 +269,21 @@ async def login_post(
     password: str = Form(...),
     db: Session = Depends(get_db),
 ):
+    ip = _client_ip(request)
+    locked = _login_lock_remaining(ip)
+    if locked:
+        return templates.TemplateResponse(
+            "login.html",
+            {
+                "request": request,
+                "error": f"Too many failed attempts. Try again in {locked} seconds.",
+            },
+            status_code=429,
+        )
+
     admin_username, admin_hash = _get_admin_creds(db)
     if username == admin_username and admin_hash and _verify_password(password, admin_hash):
+        _record_login_success(ip)
         request.session["user"] = username
         # Check if first-login password change is still required
         pw_row = db.query(Settings).filter(Settings.key == "password_changed").first()
@@ -199,6 +291,8 @@ async def login_post(
             request.session["must_change_password"] = True
             return RedirectResponse("/change-password", status_code=302)
         return RedirectResponse("/", status_code=302)
+
+    _record_login_failure(ip)
     return templates.TemplateResponse(
         "login.html", {"request": request, "error": "Invalid username or password"}
     )
@@ -653,6 +747,24 @@ async def logs_stream(request: Request):
 # Logs — support bundle download
 # --------------------------------------------------------------------------- #
 
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_URL_HOST_RE = re.compile(r"(https?://)([^/\s\"']+)")
+
+
+def _mask_url_host(url: Optional[str]) -> Optional[str]:
+    """Mask the host[:port] of a URL while keeping the scheme (http/https)."""
+    if not url:
+        return url
+    return _URL_HOST_RE.sub(lambda m: m.group(1) + "[redacted-host]", url)
+
+
+def _redact_text(text: str) -> str:
+    """Mask URL hosts and bare IPv4 addresses so a bundle can be shared safely."""
+    text = _URL_HOST_RE.sub(lambda m: m.group(1) + "[redacted-host]", text)
+    text = _IPV4_RE.sub("[redacted-ip]", text)
+    return text
+
+
 @app.get("/logs/support-bundle")
 async def download_support_bundle(request: Request, db: Session = Depends(get_db)):
     """Build and return a ZIP containing logs, sanitized job configs, run history, and system info."""
@@ -666,7 +778,9 @@ async def download_support_bundle(request: Request, db: Session = Depends(get_db
         log_file = Path(LOG_PATH)
         if log_file.exists():
             try:
-                zf.write(log_file, "sync.log")
+                raw = log_file.read_text(encoding="utf-8", errors="replace")
+                # Redact server hosts/IPs so the bundle is safe to share
+                zf.writestr("sync.log", _redact_text(raw))
             except Exception as exc:
                 zf.writestr("sync.log", f"(error reading log: {exc})\n")
         else:
@@ -679,10 +793,10 @@ async def download_support_bundle(request: Request, db: Session = Depends(get_db
             jobs_info.append({
                 "id": job.id,
                 "name": job.name,
-                "source_url": job.source_url,
+                "source_url": _mask_url_host(job.source_url),
                 "source_key": "[redacted]",
                 "source_album_name": job.source_album_name,
-                "dest_url": job.dest_url,
+                "dest_url": _mask_url_host(job.dest_url),
                 "dest_key": "[redacted]",
                 "dest_album_name": job.dest_album_name,
                 "schedule": job.schedule,
@@ -883,8 +997,32 @@ async def api_test_connection(request: Request, db: Session = Depends(get_db)):
                 for a in albums
             ],
         })
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
+    except httpx.ConnectError:
+        logger.warning("test-connection: could not connect to %s", url)
+        return JSONResponse(
+            {"error": "Could not reach the server. Check the URL and that it is "
+                      "reachable from the container."},
+            status_code=400,
+        )
+    except httpx.TimeoutException:
+        logger.warning("test-connection: timed out connecting to %s", url)
+        return JSONResponse(
+            {"error": "Connection timed out. Check the URL and your network."},
+            status_code=400,
+        )
+    except httpx.HTTPStatusError as exc:
+        logger.warning("test-connection: HTTP %s from %s", exc.response.status_code, url)
+        return JSONResponse(
+            {"error": f"Server returned HTTP {exc.response.status_code}."},
+            status_code=400,
+        )
+    except Exception:
+        # Log full detail server-side; return a generic message to the client.
+        logger.exception("test-connection failed (role=%s)", role)
+        return JSONResponse(
+            {"error": "Connection test failed. Check the URL and API key."},
+            status_code=400,
+        )
 
 
 @app.get("/api/jobs/{job_id}/status")
