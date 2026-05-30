@@ -1,7 +1,11 @@
 import asyncio
+import io
 import json
 import logging
 import os
+import subprocess
+import sys
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -13,11 +17,12 @@ from fastapi.responses import (
     RedirectResponse,
     StreamingResponse,
 )
+import bcrypt as _bcrypt
 from fastapi.templating import Jinja2Templates
-from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
+from .crypto import decrypt_secret as _decrypt_raw, encrypt_secret as _encrypt_raw
 from .database import get_db, init_db
 from .immich_client import ImmichClient
 from .models import Settings, SyncJob, SyncRun
@@ -51,7 +56,28 @@ templates.env.filters["datetimefmt"] = lambda dt, fmt="%Y-%m-%d %H:%M": (
     dt.strftime(fmt) if dt else "—"
 )
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+def _hash_password(plain: str) -> str:
+    return _bcrypt.hashpw(plain.encode("utf-8"), _bcrypt.gensalt()).decode("utf-8")
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return _bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# API key encryption helpers (wraps crypto.py with the app SECRET_KEY)
+# --------------------------------------------------------------------------- #
+
+def _encrypt_key(plain: str) -> str:
+    """Encrypt an API key for database storage."""
+    return _encrypt_raw(plain, SECRET_KEY)
+
+
+def _decrypt_key(stored: str) -> str:
+    """Decrypt a stored API key. Falls back gracefully for legacy plaintext."""
+    return _decrypt_raw(stored, SECRET_KEY)
 
 
 # --------------------------------------------------------------------------- #
@@ -60,6 +86,26 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 @app.on_event("startup")
 async def startup():
+    # Validate SECRET_KEY before anything else
+    _default_key = "change-me-to-something-random-and-long"
+    if SECRET_KEY == _default_key:
+        logger.warning(
+            "⚠️  SECRET_KEY is the default value — this is INSECURE. "
+            "Set a unique key in your environment variables."
+        )
+    elif len(SECRET_KEY) < 16:
+        logger.warning(
+            f"⚠️  SECRET_KEY is only {len(SECRET_KEY)} characters. "
+            "Minimum recommended length is 32 characters."
+        )
+    elif len(SECRET_KEY) > 128:
+        logger.warning(
+            f"⚠️  SECRET_KEY is {len(SECRET_KEY)} characters. "
+            "Values longer than 128 characters provide no additional security benefit."
+        )
+    else:
+        logger.info(f"SECRET_KEY: {len(SECRET_KEY)} characters ✓")
+
     init_db()
     init_scheduler()
 
@@ -138,8 +184,13 @@ async def login_post(
     db: Session = Depends(get_db),
 ):
     admin_username, admin_hash = _get_admin_creds(db)
-    if username == admin_username and admin_hash and pwd_context.verify(password, admin_hash):
+    if username == admin_username and admin_hash and _verify_password(password, admin_hash):
         request.session["user"] = username
+        # Check if first-login password change is still required
+        pw_row = db.query(Settings).filter(Settings.key == "password_changed").first()
+        if pw_row and pw_row.value == "false":
+            request.session["must_change_password"] = True
+            return RedirectResponse("/change-password", status_code=302)
         return RedirectResponse("/", status_code=302)
     return templates.TemplateResponse(
         "login.html", {"request": request, "error": "Invalid username or password"}
@@ -153,6 +204,50 @@ async def logout(request: Request):
 
 
 # --------------------------------------------------------------------------- #
+# Forced first-login password change
+# --------------------------------------------------------------------------- #
+
+@app.get("/change-password", response_class=HTMLResponse)
+async def change_password_get(request: Request):
+    """Standalone page displayed when the default password has never been changed."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=302)
+    return templates.TemplateResponse(
+        "change_password.html", {"request": request, "error": None}
+    )
+
+
+@app.post("/change-password")
+async def change_password_post(
+    request: Request,
+    new_password: str = Form(...),
+    confirm_password: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=302)
+
+    error = None
+    if new_password != confirm_password:
+        error = "Passwords do not match."
+    elif len(new_password) < 8:
+        error = "Password must be at least 8 characters."
+    elif new_password.strip().lower() == "admin":
+        error = "You cannot reuse the default password. Please choose a unique password."
+
+    if error:
+        return templates.TemplateResponse(
+            "change_password.html", {"request": request, "error": error}
+        )
+
+    _upsert_setting(db, "admin_password_hash", _hash_password(new_password))
+    _upsert_setting(db, "password_changed", "true")
+    request.session.pop("must_change_password", None)
+    logger.info("Admin password changed from default on first login")
+    return RedirectResponse("/", status_code=302)
+
+
+# --------------------------------------------------------------------------- #
 # Dashboard
 # --------------------------------------------------------------------------- #
 
@@ -160,6 +255,8 @@ async def logout(request: Request):
 async def dashboard(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse("/change-password", status_code=302)
 
     jobs = db.query(SyncJob).order_by(SyncJob.created_at).all()
 
@@ -210,6 +307,8 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
 async def jobs_list(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse("/change-password", status_code=302)
 
     jobs = db.query(SyncJob).order_by(SyncJob.created_at).all()
     job_rows = []
@@ -237,8 +336,16 @@ async def jobs_list(request: Request, db: Session = Depends(get_db)):
 async def job_new_get(request: Request):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse("/change-password", status_code=302)
     return templates.TemplateResponse(
-        "job_form.html", {"request": request, "job": None, "error": None}
+        "job_form.html", {
+            "request": request,
+            "job": None,
+            "has_source_key": False,
+            "has_dest_key": False,
+            "error": None,
+        }
     )
 
 
@@ -264,10 +371,10 @@ async def job_new_post(
     job = SyncJob(
         name=name.strip(),
         source_url=source_url.strip().rstrip("/"),
-        source_key=source_key.strip(),
+        source_key=_encrypt_key(source_key.strip()),
         source_album_name=source_album_name.strip(),
         dest_url=dest_url.strip().rstrip("/"),
-        dest_key=dest_key.strip(),
+        dest_key=_encrypt_key(dest_key.strip()),
         dest_album_name=dest_album_name.strip(),
         schedule=schedule.strip(),
         delete_sync=delete_sync == "on",
@@ -298,11 +405,20 @@ async def job_new_post(
 async def job_edit_get(request: Request, job_id: int, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse("/change-password", status_code=302)
     job = db.query(SyncJob).filter(SyncJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # Never send actual key values to the template — they must not appear in HTML
     return templates.TemplateResponse(
-        "job_form.html", {"request": request, "job": job, "error": None}
+        "job_form.html", {
+            "request": request,
+            "job": job,
+            "has_source_key": bool(job.source_key),
+            "has_dest_key": bool(job.dest_key),
+            "error": None,
+        }
     )
 
 
@@ -312,10 +428,10 @@ async def job_edit_post(
     job_id: int,
     name: str = Form(...),
     source_url: str = Form(...),
-    source_key: str = Form(...),
+    source_key: str = Form(""),   # blank = keep existing encrypted key
     source_album_name: str = Form(...),
     dest_url: str = Form(...),
-    dest_key: str = Form(...),
+    dest_key: str = Form(""),     # blank = keep existing encrypted key
     dest_album_name: str = Form(...),
     schedule: str = Form("0 */6 * * *"),
     delete_sync: Optional[str] = Form(None),
@@ -332,10 +448,13 @@ async def job_edit_post(
 
     job.name = name.strip()
     job.source_url = source_url.strip().rstrip("/")
-    job.source_key = source_key.strip()
+    # Only replace the key if a new value was provided — blank means "keep existing"
+    if source_key.strip():
+        job.source_key = _encrypt_key(source_key.strip())
     job.source_album_name = source_album_name.strip()
     job.dest_url = dest_url.strip().rstrip("/")
-    job.dest_key = dest_key.strip()
+    if dest_key.strip():
+        job.dest_key = _encrypt_key(dest_key.strip())
     job.dest_album_name = dest_album_name.strip()
     job.schedule = schedule.strip()
     job.delete_sync = delete_sync == "on"
@@ -476,6 +595,8 @@ async def _run_background(job_id: int, run_id: int):
 async def logs_page(request: Request):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse("/change-password", status_code=302)
     return templates.TemplateResponse("logs.html", {"request": request})
 
 
@@ -522,6 +643,107 @@ async def logs_stream(request: Request):
 
 
 # --------------------------------------------------------------------------- #
+# Logs — support bundle download
+# --------------------------------------------------------------------------- #
+
+@app.get("/logs/support-bundle")
+async def download_support_bundle(request: Request, db: Session = Depends(get_db)):
+    """Build and return a ZIP containing logs, sanitized job configs, run history, and system info."""
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=302)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+
+        # 1. Sync log file
+        log_file = Path(LOG_PATH)
+        if log_file.exists():
+            try:
+                zf.write(log_file, "sync.log")
+            except Exception as exc:
+                zf.writestr("sync.log", f"(error reading log: {exc})\n")
+        else:
+            zf.writestr("sync.log", "(no log file found)\n")
+
+        # 2. Job configurations — API keys redacted
+        jobs = db.query(SyncJob).order_by(SyncJob.created_at).all()
+        jobs_info = []
+        for job in jobs:
+            jobs_info.append({
+                "id": job.id,
+                "name": job.name,
+                "source_url": job.source_url,
+                "source_key": "[redacted]",
+                "source_album_name": job.source_album_name,
+                "dest_url": job.dest_url,
+                "dest_key": "[redacted]",
+                "dest_album_name": job.dest_album_name,
+                "schedule": job.schedule,
+                "enabled": job.enabled,
+                "delete_sync": job.delete_sync,
+                "cleanup_cache": job.cleanup_cache,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+            })
+        zf.writestr("jobs.json", json.dumps(jobs_info, indent=2))
+
+        # 3. Last 100 sync run records
+        runs = (
+            db.query(SyncRun)
+            .order_by(SyncRun.started_at.desc())
+            .limit(100)
+            .all()
+        )
+        runs_info = []
+        for run in runs:
+            runs_info.append({
+                "id": run.id,
+                "job_id": run.job_id,
+                "job_name": run.job.name if run.job else "Unknown",
+                "status": run.status,
+                "started_at": run.started_at.isoformat() if run.started_at else None,
+                "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+                "assets_found": run.assets_found,
+                "assets_downloaded": run.assets_downloaded,
+                "assets_uploaded": run.assets_uploaded,
+                "assets_skipped": run.assets_skipped,
+                "assets_failed": run.assets_failed,
+                "error_message": run.error_message,
+            })
+        zf.writestr("sync_runs.json", json.dumps(runs_info, indent=2))
+
+        # 4. System info
+        immich_go_ver = "unknown"
+        try:
+            result = subprocess.run(
+                ["immich-go", "--version"], capture_output=True, text=True, timeout=5
+            )
+            immich_go_ver = (result.stdout or result.stderr or "").strip().splitlines()[0]
+        except Exception:
+            pass
+
+        system_info = {
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "python_version": sys.version,
+            "immich_go_version": immich_go_ver,
+            "log_path": LOG_PATH,
+            "db_path": os.getenv("DB_PATH", "/app/appdata/config.db"),
+            "cache_path": os.getenv("CACHE_PATH", "/app/appdata/cache"),
+            "tz": os.getenv("TZ", "(not set)"),
+        }
+        zf.writestr("system_info.json", json.dumps(system_info, indent=2))
+
+    buf.seek(0)
+    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    filename = f"immich-album-sync-support-{timestamp}.zip"
+
+    return StreamingResponse(
+        iter([buf.read()]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Settings
 # --------------------------------------------------------------------------- #
 
@@ -529,6 +751,8 @@ async def logs_stream(request: Request):
 async def settings_get(request: Request, db: Session = Depends(get_db)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse("/change-password", status_code=302)
     settings = {s.key: s.value for s in db.query(Settings).all()}
     return templates.TemplateResponse(
         "settings.html",
@@ -566,7 +790,7 @@ async def settings_password(
         return RedirectResponse("/login", status_code=302)
 
     _, admin_hash = _get_admin_creds(db)
-    if not admin_hash or not pwd_context.verify(current_password, admin_hash):
+    if not admin_hash or not _verify_password(current_password, admin_hash):
         return RedirectResponse("/settings?error=Current+password+incorrect", status_code=302)
 
     if new_password != confirm_password:
@@ -575,7 +799,9 @@ async def settings_password(
     if len(new_password) < 8:
         return RedirectResponse("/settings?error=Password+must+be+at+least+8+characters", status_code=302)
 
-    _upsert_setting(db, "admin_password_hash", pwd_context.hash(new_password))
+    _upsert_setting(db, "admin_password_hash", _hash_password(new_password))
+    _upsert_setting(db, "password_changed", "true")
+    request.session.pop("must_change_password", None)
     return RedirectResponse("/settings?success=Password+updated+successfully", status_code=302)
 
 
@@ -593,7 +819,14 @@ def _upsert_setting(db: Session, key: str, value: str):
 # --------------------------------------------------------------------------- #
 
 @app.post("/api/test-connection")
-async def api_test_connection(request: Request):
+async def api_test_connection(request: Request, db: Session = Depends(get_db)):
+    """
+    Test connectivity and check required API key permissions.
+
+    Body: { url, api_key, role: "source"|"dest", job_id? }
+    When api_key is blank and job_id is provided, the stored (encrypted) key
+    for that job is used so the form never needs to re-expose the key value.
+    """
     if not _logged_in(request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
@@ -604,28 +837,45 @@ async def api_test_connection(request: Request):
 
     url = (body.get("url") or "").strip().rstrip("/")
     api_key = (body.get("api_key") or "").strip()
+    role = (body.get("role") or "source").strip()      # "source" or "dest"
+    job_id = body.get("job_id")                        # optional — use stored key
+
+    # If the form left the key blank (edit mode), use the stored encrypted key
+    if not api_key and job_id:
+        try:
+            job = db.query(SyncJob).filter(SyncJob.id == int(job_id)).first()
+            if job:
+                stored = job.source_key if role == "source" else job.dest_key
+                api_key = _decrypt_key(stored)
+        except Exception:
+            pass
 
     if not url or not api_key:
-        return JSONResponse({"error": "url and api_key are required"}, status_code=400)
+        return JSONResponse(
+            {"error": "URL and API key are required. Enter a key or save the job first."},
+            status_code=400,
+        )
 
     try:
         client = ImmichClient(url, api_key)
-        info = await client.test_connection()
-        albums = await client.get_albums()
-        return JSONResponse(
-            {
-                "success": True,
-                "server_info": info,
-                "albums": [
-                    {
-                        "id": a["id"],
-                        "name": a.get("albumName", ""),
-                        "asset_count": a.get("assetCount", 0),
-                    }
-                    for a in albums
-                ],
-            }
+        permissions, albums = await client.check_permissions(role)
+
+        all_required_ok = all(
+            p["ok"] is not False for p in permissions
         )
+
+        return JSONResponse({
+            "success": all_required_ok,
+            "permissions": permissions,
+            "albums": [
+                {
+                    "id": a["id"],
+                    "name": a.get("albumName", ""),
+                    "asset_count": a.get("assetCount", 0),
+                }
+                for a in albums
+            ],
+        })
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 

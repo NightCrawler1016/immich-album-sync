@@ -52,13 +52,14 @@ def init_db():
     db = SessionLocal()
     try:
         from .models import Settings
-        from passlib.context import CryptContext
-
-        pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+        import bcrypt
 
         # Seed default admin password (user should change this on first login)
         if not db.query(Settings).filter(Settings.key == "admin_password_hash").first():
-            db.add(Settings(key="admin_password_hash", value=pwd_context.hash("admin")))
+            hashed = bcrypt.hashpw(b"admin", bcrypt.gensalt()).decode("utf-8")
+            db.add(Settings(key="admin_password_hash", value=hashed))
+            # Flag forces the password-change prompt on first login
+            db.add(Settings(key="password_changed", value="false"))
             logger.info("Default admin password set to 'admin' — please change it immediately")
 
         if not db.query(Settings).filter(Settings.key == "admin_username").first():

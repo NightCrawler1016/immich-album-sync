@@ -8,12 +8,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from .crypto import decrypt_secret
 from .immich_client import ImmichClient
+
+_SECRET_KEY = os.getenv("SECRET_KEY", "change-me-to-something-random-and-long")
 
 logger = logging.getLogger(__name__)
 
 CACHE_BASE = os.getenv("CACHE_PATH", "/app/appdata/cache")
 LOG_PATH = os.getenv("LOG_PATH", "/app/appdata/logs/sync.log")
+
+# Batch processing limits — prevent cache overflow during large first-time syncs.
+# Files are downloaded into the cache until a limit is hit, then uploaded and cleared
+# before the next batch begins. 0 = unlimited for that dimension.
+_BATCH_SIZE_BYTES: int = int(os.getenv("BATCH_SIZE_MB", "10240")) * 1024 * 1024  # default 10 GB
+_BATCH_FILE_COUNT: int = int(os.getenv("BATCH_FILE_COUNT", "0"))                 # default unlimited
 
 # --------------------------------------------------------------------------- #
 # Logging setup
@@ -79,6 +88,10 @@ async def run_sync_job(
             except Exception:
                 pass
 
+    # Decrypt API keys — handles both Fernet-encrypted and legacy plaintext values
+    source_api_key = decrypt_secret(job.source_key, _SECRET_KEY)
+    dest_api_key = decrypt_secret(job.dest_key, _SECRET_KEY)
+
     job_cache_dir = Path(CACHE_BASE) / f"job_{job.id}"
     files_dir = job_cache_dir / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
@@ -89,7 +102,7 @@ async def run_sync_job(
     sync_log.info(f"   Dest   : {job.dest_url}  album='{job.dest_album_name}'")
 
     try:
-        source = ImmichClient(job.source_url, job.source_key)
+        source = ImmichClient(job.source_url, source_api_key)
 
         # ------------------------------------------------------------------ #
         # Step 1 — Locate the album
@@ -147,71 +160,160 @@ async def run_sync_job(
         sync_log.info(f"   Queue  : {len(to_download)} files to process (incl. companions)")
 
         # ------------------------------------------------------------------ #
-        # Step 3 — Download originals
+        # Steps 3+4+5 — Download and upload in rolling batches
+        #
+        # Files are staged in files_dir until a batch limit is reached, then
+        # immediately uploaded and cleared before the next batch begins.
+        # This prevents the local cache from growing unbounded during large
+        # first-time syncs (e.g. multi-hundred-GB albums).
+        #
+        # Limits read from env at module load:
+        #   BATCH_SIZE_MB  — max MB per batch  (0 = unlimited, default 10240)
+        #   BATCH_FILE_COUNT — max files/batch (0 = unlimited, default 0)
         # ------------------------------------------------------------------ #
+        cleanup = getattr(job, "cleanup_cache", False) or \
+                  os.getenv("CLEANUP_CACHE", "false").lower() == "true"
+
+        _size_limit = _BATCH_SIZE_BYTES   # bytes; 0 = unlimited
+        _count_limit = _BATCH_FILE_COUNT  # files; 0 = unlimited
+        is_batching = _size_limit > 0 or _count_limit > 0
+
+        if is_batching:
+            _parts: list[str] = []
+            if _size_limit > 0:
+                _parts.append(f"≤{_size_limit // 1_073_741_824} GB")
+            if _count_limit > 0:
+                _parts.append(f"≤{_count_limit} files")
+            sync_log.info(f"   Batch  : enabled ({' + '.join(_parts)} per batch)")
+
         downloaded = skipped = failed = 0
+        total_uploaded = 0
+        batch_files: list[Path] = []
+        batch_bytes = 0
+        batch_num = 0
+        total_items = len(to_download)
 
-        for item in to_download:
+        for idx, item in enumerate(to_download):
             dest_file = files_dir / item["filename"]
+            file_bytes = 0
 
-            # Already cached?
+            # Download or reuse cached file
             if dest_file.exists() and dest_file.stat().st_size > 0:
+                file_bytes = dest_file.stat().st_size
                 skipped += 1
+            else:
+                try:
+                    file_bytes = await source.download_original(item["id"], str(dest_file))
+                    sync_log.info(f"   ↓  {item['filename']}  ({file_bytes / 1_048_576:.1f} MB)")
+                    downloaded += 1
+                except Exception as exc:
+                    sync_log.error(f"   ✗  {item['filename']}: {exc}")
+                    failed += 1
+                    continue  # failed file — skip batch tracking
+
+            batch_files.append(dest_file)
+            batch_bytes += file_bytes
+
+            is_last = (idx == total_items - 1)
+            size_full = _size_limit > 0 and batch_bytes >= _size_limit
+            count_full = _count_limit > 0 and len(batch_files) >= _count_limit
+
+            # Only flush when a limit is hit or we've reached the final item
+            if not (size_full or count_full or is_last):
                 continue
 
-            try:
-                size_bytes = await source.download_original(item["id"], str(dest_file))
-                size_mb = size_bytes / (1024 * 1024)
-                sync_log.info(f"   ↓  {item['filename']}  ({size_mb:.1f} MB)")
-                downloaded += 1
-            except Exception as exc:
-                sync_log.error(f"   ✗  {item['filename']}: {exc}")
-                failed += 1
+            # ── Flush batch ────────────────────────────────────────────────
+            batch_num += 1
+            batch_gb = batch_bytes / 1_073_741_824
+            remaining = total_items - idx - 1
+
+            if is_batching:
+                status_str = f"{remaining} item(s) remaining" if remaining else "final batch"
+                sync_log.info(
+                    f"   ─── Batch {batch_num}: {len(batch_files)} files "
+                    f"({batch_gb:.2f} GB) — {status_str} ───"
+                )
+
+            dir_file_count = sum(1 for f in files_dir.glob("*") if f.is_file())
+
+            if dir_file_count == 0:
+                sync_log.info("   Upload : No files in cache — skipping upload step")
+            else:
+                if is_batching:
+                    log(f"Uploading batch {batch_num} "
+                        f"({len(batch_files)} files, {batch_gb:.1f} GB)…")
+                else:
+                    log(f"Uploading {dir_file_count} files to '{job.dest_album_name}'…")
+
+                upload_result = await _run_immich_go_upload(
+                    server=job.dest_url,
+                    api_key=dest_api_key,
+                    album_name=job.dest_album_name,
+                    source_dir=str(files_dir),
+                    sync_log=sync_log,
+                )
+                batch_up = upload_result.get("uploaded", 0)
+                total_uploaded += batch_up
+                # Update running total so partial-failure runs still record progress
+                results["assets_uploaded"] = total_uploaded
+
+                if upload_result.get("error"):
+                    results["status"] = "partial"
+                    results["error_message"] = upload_result["error"]
+                    sync_log.error(f"   Upload : {upload_result['error']}")
+                    if not is_last:
+                        sync_log.warning(
+                            "   Upload error on mid-batch — stopping early; "
+                            "cached files retained for next run"
+                        )
+                        break  # leave cache intact; next run will resume
+                else:
+                    if is_batching:
+                        sync_log.info(
+                            f"   Batch {batch_num}: {batch_up} uploaded  "
+                            f"(running total: {total_uploaded})"
+                        )
+                    else:
+                        sync_log.info(
+                            f"   Upload : {total_uploaded} files pushed to destination"
+                        )
+                    log(f"Upload complete — {total_uploaded} uploaded so far")
+
+            # Clear intermediate batches always; clear final batch only if cleanup_cache=True
+            clear_now = (not is_last) or \
+                        (is_last and cleanup and results["status"] == "success")
+            if clear_now:
+                shutil.rmtree(str(files_dir), ignore_errors=True)
+                files_dir.mkdir(parents=True, exist_ok=True)
+                if is_last:
+                    sync_log.info("   Cache  : Cleaned up after successful upload")
+                else:
+                    sync_log.info(
+                        f"   Batch {batch_num}: cache cleared, ready for next batch"
+                    )
+
+            batch_files = []
+            batch_bytes = 0
 
         results["assets_downloaded"] = downloaded
         results["assets_skipped"] = skipped
         results["assets_failed"] = failed
+        results["assets_uploaded"] = total_uploaded
 
         sync_log.info(
-            f"   DL done: {downloaded} new  |  {skipped} cached  |  {failed} failed"
+            f"   Done   : {downloaded} new  |  {skipped} cached  |  "
+            f"{failed} failed  |  {total_uploaded} uploaded"
         )
-        log(f"Downloads complete — {downloaded} new, {skipped} already cached, {failed} failed")
-
-        # ------------------------------------------------------------------ #
-        # Step 4 — Upload via immich-go
-        # ------------------------------------------------------------------ #
-        file_count = sum(1 for _ in files_dir.glob("*") if _.is_file())
-        if file_count == 0:
-            sync_log.info("   Upload : No files in cache — skipping upload step")
-        else:
-            log(f"Uploading {file_count} files to '{job.dest_album_name}'…")
-            upload_result = await _run_immich_go_upload(
-                server=job.dest_url,
-                api_key=job.dest_key,
-                album_name=job.dest_album_name,
-                source_dir=str(files_dir),
-                sync_log=sync_log,
+        if is_batching and batch_num > 1:
+            log(
+                f"All {batch_num} batches complete — "
+                f"{total_uploaded} files uploaded to destination"
             )
-            results["assets_uploaded"] = upload_result.get("uploaded", 0)
-
-            if upload_result.get("error"):
-                results["status"] = "partial"
-                results["error_message"] = upload_result["error"]
-                sync_log.error(f"   Upload : {upload_result['error']}")
-            else:
-                sync_log.info(f"   Upload : {results['assets_uploaded']} files pushed to destination")
-
-            log(f"Upload complete — {results['assets_uploaded']} uploaded")
-
-        # ------------------------------------------------------------------ #
-        # Step 5 — Optional cache cleanup
-        # ------------------------------------------------------------------ #
-        cleanup = getattr(job, "cleanup_cache", False) or \
-                  os.getenv("CLEANUP_CACHE", "false").lower() == "true"
-        if cleanup and results["status"] == "success":
-            shutil.rmtree(str(files_dir), ignore_errors=True)
-            files_dir.mkdir(parents=True, exist_ok=True)
-            sync_log.info("   Cache  : Cleaned up after successful upload")
+        else:
+            log(
+                f"Downloads complete — {downloaded} new, {skipped} already cached, "
+                f"{total_uploaded} uploaded"
+            )
 
     except Exception as exc:
         results["status"] = "failed"
@@ -245,22 +347,24 @@ async def _run_immich_go_upload(
     Supports immich-go v0.22+ command structure.
     Returns {"uploaded": int, "error": str|None}
     """
-    # immich-go v0.22+ syntax:
-    #   immich-go --server URL --api-key KEY upload from-folder --album NAME --recursive DIR
+    # immich-go v0.31 syntax (flags go AFTER the subcommand, matching README examples):
+    #   immich-go upload from-folder --server URL --api-key KEY --into-album NAME --recursive DIR
+    # NOTE: placing --server/--api-key before "upload" as global flags breaks v0.31's
+    #       argument parser — they must follow the "from-folder" subcommand.
     cmd = [
         "immich-go",
-        "--server", server,
-        "--api-key", api_key,
         "upload",
         "from-folder",
-        "--album", album_name,
+        "--server", server,
+        "--api-key", api_key,
+        "--into-album", album_name,
         "--recursive",
         source_dir,
     ]
 
     sync_log.info(
-        f"   CMD    : immich-go --server {server} upload from-folder "
-        f"--album '{album_name}' {source_dir}"
+        f"   CMD    : immich-go upload from-folder --server {server} "
+        f"--into-album '{album_name}' {source_dir}"
     )
 
     try:
@@ -281,10 +385,18 @@ async def _run_immich_go_upload(
                 if text:
                     sync_log.info(f"   [go]   {text}")
                     stdout_lines.append(text)
-                    # Try to parse upload count from progress lines
-                    nums = re.findall(r"\d+", text)
-                    if "upload" in text.lower() and nums:
-                        uploaded_count = max(uploaded_count, int(nums[0]))
+
+                    # Parse the final summary report lines (most accurate).
+                    # "added to album : 3"  — preferred: assets actually in the album
+                    m = re.search(r"added to album\s*:\s*(\d+)", text, re.IGNORECASE)
+                    if m:
+                        uploaded_count = int(m.group(1))
+                        continue
+
+                    # "uploaded successfully : 1"  — fallback if no album line appears
+                    m = re.search(r"uploaded successfully\s*:\s*(\d+)", text, re.IGNORECASE)
+                    if m:
+                        uploaded_count = max(uploaded_count, int(m.group(1)))
 
         async def read_stderr():
             async for line in proc.stderr:

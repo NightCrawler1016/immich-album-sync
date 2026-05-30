@@ -85,7 +85,7 @@
     Target="SECRET_KEY"
     Default="change-me-please-use-a-long-random-string-here"
     Mode=""
-    Description="REQUIRED: Change this to a long random string used to sign session cookies. Using the default value is insecure. Generate one at: https://1password.com/password-generator/ (32+ characters). Changing this will log out all active sessions."
+    Description="REQUIRED: Change to a unique random string used to sign session cookies and encrypt stored API keys. Using the default value is INSECURE. Key length: minimum 16 characters | recommended 32–64 characters | maximum 128 characters (longer values provide no extra security). Generate a strong key at: https://1password.com/password-generator/ — select 32–64 characters, all character types. WARNING: changing this key after initial setup will invalidate all stored API keys and log out all active sessions — you will need to re-enter API keys for every sync job."
     Type="Variable"
     Display="always"
     Required="true"
@@ -118,11 +118,41 @@
     Target="CACHE_PATH"
     Default="/app/appdata/cache"
     Mode=""
-    Description="Internal path for the download cache. Only change this if you want to map the cache to a separate volume (e.g. a fast SSD cache drive). Leave blank to use the default inside App Data."
+    Description="Path inside the container where original files are temporarily staged before uploading to the destination server. The default stores the cache inside the App Data directory.
+
+To store the cache on a different disk, SSD pool, or network share (recommended for large first-time syncs):
+  1. In the Docker template, add a second Path mapping:
+       Container path: /app/cache
+       Host path: /mnt/user/YourDisk/immich-sync-cache  (or any writable path)
+  2. Set this field to: /app/cache
+
+This lets you route multi-GB or multi-TB downloads to a large array disk or NAS share without filling your primary Unraid cache pool. The container must have write access to whatever path you choose."
+    Type="Variable"
+    Display="always"
+    Required="false"
+    Mask="false">/app/appdata/cache</Config>
+
+  <Config
+    Name="Max Cache Batch Size (MB)"
+    Target="BATCH_SIZE_MB"
+    Default="10240"
+    Mode=""
+    Description="Maximum amount of data (in megabytes) to download before uploading a batch to the destination server. After each batch is uploaded it is cleared from the cache, then the next batch begins. This prevents the local cache from growing too large during first-time syncs of very large albums. Default: 10240 (10 GB). Set to 0 to download all files before uploading (disables size-based batching)."
     Type="Variable"
     Display="advanced"
     Required="false"
-    Mask="false">/app/appdata/cache</Config>
+    Mask="false">10240</Config>
+
+  <Config
+    Name="Max Files Per Batch"
+    Target="BATCH_FILE_COUNT"
+    Default="0"
+    Mode=""
+    Description="Maximum number of files to stage per batch before uploading. Works alongside Max Cache Batch Size — whichever limit is reached first triggers an upload cycle. Default: 0 (no file-count limit; only the size limit applies). Example: set to 500 to process albums in groups of 500 files regardless of total size."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false">0</Config>
 
   <Config
     Name="Log File Path"

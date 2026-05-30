@@ -8,24 +8,32 @@ LABEL org.opencontainers.image.licenses="MIT"
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    jq \
     ca-certificates \
     tar \
     && rm -rf /var/lib/apt/lists/*
 
-# Install immich-go binary
-ARG IMMICH_GO_VERSION=0.22.2
-ARG TARGETARCH=amd64
-RUN ARCH="${TARGETARCH}" && \
-    if [ "${ARCH}" = "amd64" ]; then ARCH_NAME="x86_64"; \
-    elif [ "${ARCH}" = "arm64" ]; then ARCH_NAME="arm64"; \
-    else ARCH_NAME="x86_64"; fi && \
-    curl -fsSL "https://github.com/simulot/immich-go/releases/download/${IMMICH_GO_VERSION}/immich-go_Linux_${ARCH_NAME}.tar.gz" \
+# Install immich-go binary (pinned to a tested version to avoid breaking CLI changes).
+# Use uname -m to detect the real running architecture — reliable under
+# both native builds and QEMU cross-compilation (where ARG TARGETARCH
+# can silently stay at its default value instead of being overridden).
+# v0.31.0 uses: immich-go upload from-folder --into-album NAME --recursive DIR
+ENV IMMICH_GO_VERSION=v0.31.0
+RUN set -ex && \
+    ARCH=$(uname -m) && \
+    case "$ARCH" in \
+        x86_64)  BIN_ARCH="x86_64" ;; \
+        aarch64) BIN_ARCH="arm64" ;; \
+        *)       BIN_ARCH="x86_64" ;; \
+    esac && \
+    echo "Installing immich-go ${IMMICH_GO_VERSION} for arch=${ARCH} (${BIN_ARCH})" && \
+    curl -fsSL "https://github.com/simulot/immich-go/releases/download/${IMMICH_GO_VERSION}/immich-go_Linux_${BIN_ARCH}.tar.gz" \
         -o /tmp/immich-go.tar.gz && \
-    tar -xzf /tmp/immich-go.tar.gz -C /usr/local/bin/ && \
-    chmod +x /usr/local/bin/immich-go && \
-    rm /tmp/immich-go.tar.gz && \
-    immich-go --help > /dev/null 2>&1 || true
+    mkdir -p /tmp/immich-go-extract && \
+    tar -xzf /tmp/immich-go.tar.gz -C /tmp/immich-go-extract && \
+    find /tmp/immich-go-extract -name "immich-go" -type f | head -1 | \
+        xargs -I{} install -m 755 {} /usr/local/bin/immich-go && \
+    rm -rf /tmp/immich-go.tar.gz /tmp/immich-go-extract && \
+    immich-go --version
 
 WORKDIR /app
 
