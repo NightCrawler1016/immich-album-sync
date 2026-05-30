@@ -89,24 +89,36 @@ class ImmichClient:
         async with httpx.AsyncClient(timeout=10.0) as client:
 
             # ── API key validity ─────────────────────────────────────────────
+            # GET /api/users/me requires the user.read scope.
+            # 401 = key is invalid or expired (hard stop).
+            # 403 = key is valid but lacks user.read — that scope is NOT required
+            #       for syncing; continue to check album.read / asset.read instead.
             try:
                 resp = await client.get(
                     f"{self.base_url}/api/users/me", headers=self.headers
                 )
-                if resp.status_code in (401, 403):
+                if resp.status_code == 401:
                     results.append({
                         "name": "API Key", "desc": "Valid, non-expired API key",
                         "ok": False,
-                        "detail": f"HTTP {resp.status_code} — key invalid or expired",
+                        "detail": "HTTP 401 — key invalid or expired",
                     })
                     return results, albums
-                resp.raise_for_status()
-                user = resp.json()
-                results.append({
-                    "name": "API Key", "desc": "Valid, non-expired API key",
-                    "ok": True,
-                    "detail": user.get("email") or user.get("name") or "authenticated",
-                })
+                elif resp.status_code == 403:
+                    # Valid key — user.read scope not granted, which is fine
+                    results.append({
+                        "name": "API Key", "desc": "Valid, non-expired API key",
+                        "ok": True,
+                        "detail": "authenticated (user.read scope not required)",
+                    })
+                else:
+                    resp.raise_for_status()
+                    user = resp.json()
+                    results.append({
+                        "name": "API Key", "desc": "Valid, non-expired API key",
+                        "ok": True,
+                        "detail": user.get("email") or user.get("name") or "authenticated",
+                    })
             except Exception as exc:
                 results.append({
                     "name": "API Key", "desc": "Valid, non-expired API key",
