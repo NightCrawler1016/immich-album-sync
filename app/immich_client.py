@@ -154,44 +154,106 @@ class ImmichClient:
                     "ok": False, "detail": str(exc),
                 })
 
-            # ── asset.read ───────────────────────────────────────────────────
-            # Test by fetching the first album's full detail (includes asset list)
-            asset_read_ok = False
+            # ── Grab a sample asset id to test asset-level scopes ─────────────
+            # Walk albums until we find one containing at least one asset.
+            # The album-detail endpoint is covered by album.read, so this does
+            # not prove asset.read / asset.download on its own.
+            sample_asset_id: str | None = None
             if albums:
+                for alb in albums:
+                    try:
+                        resp = await client.get(
+                            f"{self.base_url}/api/albums/{alb['id']}",
+                            headers=self.headers,
+                        )
+                        if resp.status_code == 403:
+                            break  # album.read denied — already reflected above
+                        resp.raise_for_status()
+                        alb_assets = resp.json().get("assets", [])
+                        if alb_assets:
+                            sample_asset_id = alb_assets[0]["id"]
+                            break
+                    except Exception:
+                        continue
+
+            # ── asset.read (metadata) ────────────────────────────────────────
+            # GET /api/assets/{id} returns filenames + Live Photo pairing info.
+            if sample_asset_id:
                 try:
                     resp = await client.get(
-                        f"{self.base_url}/api/albums/{albums[0]['id']}",
+                        f"{self.base_url}/api/assets/{sample_asset_id}",
                         headers=self.headers,
                     )
                     if resp.status_code == 403:
                         results.append({
                             "name": "asset.read",
-                            "desc": "Read asset metadata and download original files",
+                            "desc": "Read asset metadata (filenames, Live Photo pairing)",
                             "ok": False,
                             "detail": "Permission denied — enable asset.read scope on this API key",
                         })
                     else:
                         resp.raise_for_status()
-                        asset_read_ok = True
                         results.append({
                             "name": "asset.read",
-                            "desc": "Read asset metadata and download original files",
-                            "ok": True, "detail": "Verified via album asset list",
+                            "desc": "Read asset metadata (filenames, Live Photo pairing)",
+                            "ok": True, "detail": "Verified against a sample asset",
                         })
                 except Exception as exc:
                     results.append({
                         "name": "asset.read",
-                        "desc": "Read asset metadata and download original files",
+                        "desc": "Read asset metadata (filenames, Live Photo pairing)",
                         "ok": False, "detail": str(exc),
                     })
             else:
                 results.append({
                     "name": "asset.read",
-                    "desc": "Read asset metadata and download original files",
+                    "desc": "Read asset metadata (filenames, Live Photo pairing)",
                     "ok": True,
-                    "detail": "Assumed OK — no albums present to test against",
+                    "detail": "Assumed OK — no assets available to test against",
                 })
-                asset_read_ok = True
+
+            # ── asset.download (source only) ─────────────────────────────────
+            # GET /api/assets/{id}/original requires the asset.download scope —
+            # this is SEPARATE from asset.read. A key with only album.read +
+            # asset.read passes every other check but still gets 403 here, so we
+            # must test it explicitly. Request a single byte via Range to keep
+            # the probe cheap.
+            if role == "source":
+                if sample_asset_id:
+                    try:
+                        resp = await client.get(
+                            f"{self.base_url}/api/assets/{sample_asset_id}/original",
+                            headers={**self.headers, "Range": "bytes=0-0"},
+                            follow_redirects=True,
+                        )
+                        if resp.status_code == 403:
+                            results.append({
+                                "name": "asset.download",
+                                "desc": "Download original photo and video files",
+                                "ok": False,
+                                "detail": "Permission denied — enable asset.download scope on this API key",
+                            })
+                        else:
+                            resp.raise_for_status()
+                            results.append({
+                                "name": "asset.download",
+                                "desc": "Download original photo and video files",
+                                "ok": True,
+                                "detail": "Verified — original file is downloadable",
+                            })
+                    except Exception as exc:
+                        results.append({
+                            "name": "asset.download",
+                            "desc": "Download original photo and video files",
+                            "ok": False, "detail": str(exc),
+                        })
+                else:
+                    results.append({
+                        "name": "asset.download",
+                        "desc": "Download original photo and video files",
+                        "ok": None,
+                        "detail": "Cannot verify — no assets in any album to test against",
+                    })
 
             if role == "dest":
                 # ── album.write ──────────────────────────────────────────────
