@@ -357,6 +357,7 @@ In the **Live Logs** page, click **Download Support Bundle** to get a ZIP contai
 | Symptom | Likely Cause | Fix |
 |---|---|---|
 | Container starts but no logs | Wrong volume mapping | Ensure `/app/appdata` is mapped to a writable host path |
+| Permission errors writing to appdata | App runs as non-root `PUID:PGID` (default `99:100`) but your appdata is owned by another user | Set `PUID`/`PGID` to match your appdata owner, or `chown` the appdata path to `99:100` (Unraid `nobody:users`) |
 | Redirected to "Set Your Password" on login | First-login prompt (by design) | Set a new password — you cannot skip this step |
 | "Invalid username or password" | Wrong credentials | Default is `admin` / `admin`; check Settings if you changed it |
 | API key test fails | Insufficient permissions | Use Immich's API key settings to grant required roles (see table above) |
