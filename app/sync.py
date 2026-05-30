@@ -46,6 +46,27 @@ def _get_sync_file_logger() -> logging.Logger:
     return sync_logger
 
 
+def _clear_dir_contents(path: Path) -> None:
+    """Delete everything inside *path* while keeping the directory itself.
+
+    Removing and recreating the directory races on network shares (SMB/CIFS):
+    ``mkdir`` can raise ``FileExistsError`` immediately after ``rmtree`` because
+    the directory-entry removal hasn't fully propagated. Clearing the contents
+    in place never touches the directory inode, so it sidesteps the race.
+    """
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    for child in path.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            try:
+                child.unlink()
+            except FileNotFoundError:
+                pass
+
+
 # --------------------------------------------------------------------------- #
 # Main sync entry point
 # --------------------------------------------------------------------------- #
@@ -283,14 +304,21 @@ async def run_sync_job(
             clear_now = (not is_last) or \
                         (is_last and cleanup and results["status"] == "success")
             if clear_now:
-                shutil.rmtree(str(files_dir), ignore_errors=True)
-                files_dir.mkdir(parents=True, exist_ok=True)
-                if is_last:
-                    sync_log.info("   Cache  : Cleaned up after successful upload")
-                else:
-                    sync_log.info(
-                        f"   Batch {batch_num}: cache cleared, ready for next batch"
-                    )
+                # Empty the staged files but keep files_dir itself. Removing and
+                # recreating the directory races on network shares (SMB/CIFS):
+                # mkdir() can raise FileExistsError right after rmtree() because
+                # the directory-entry removal hasn't propagated yet. A cleanup
+                # failure must never fail an already-successful upload.
+                try:
+                    _clear_dir_contents(files_dir)
+                    if is_last:
+                        sync_log.info("   Cache  : Cleaned up after successful upload")
+                    else:
+                        sync_log.info(
+                            f"   Batch {batch_num}: cache cleared, ready for next batch"
+                        )
+                except Exception as exc:
+                    sync_log.warning(f"   Cache  : Could not clear staged files: {exc}")
 
             batch_files = []
             batch_bytes = 0
