@@ -43,7 +43,7 @@ Immich A (private)  ──────────────▶  Immich B (pub
 
 <div align="center">
 
-<img src="screenshots/1-dashboard.png" alt="Dashboard" width="900" />
+<a href="screenshots/1-dashboard.png"><img src="screenshots/1-dashboard.png" alt="Dashboard" width="900" /></a>
 
 <sub><b>Dashboard</b> — job overview, status tiles, and recent run history</sub>
 
@@ -52,21 +52,21 @@ Immich A (private)  ──────────────▶  Immich B (pub
 <table>
   <tr>
     <td align="center" width="50%">
-      <img src="screenshots/2-sync-jobs.png" alt="Sync Jobs" /><br/>
+      <a href="screenshots/2-sync-jobs.png"><img src="screenshots/2-sync-jobs.png" alt="Sync Jobs" /></a><br/>
       <sub><b>Sync Jobs</b> — manage all album sync rules at a glance</sub>
     </td>
     <td align="center" width="50%">
-      <img src="screenshots/3-edit-sync-jobs.png" alt="Edit Job" /><br/>
+      <a href="screenshots/3-edit-sync-jobs.png"><img src="screenshots/3-edit-sync-jobs.png" alt="Edit Job" /></a><br/>
       <sub><b>Edit Job</b> — servers, API keys, schedule &amp; behavior</sub>
     </td>
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src="screenshots/4-live-logs.png" alt="Live Logs" /><br/>
+      <a href="screenshots/4-live-logs.png"><img src="screenshots/4-live-logs.png" alt="Live Logs" /></a><br/>
       <sub><b>Live Logs</b> — real-time, color-coded sync activity stream</sub>
     </td>
     <td align="center" width="50%">
-      <img src="screenshots/5-settings.png" alt="Settings" /><br/>
+      <a href="screenshots/5-settings.png"><img src="screenshots/5-settings.png" alt="Settings" /></a><br/>
       <sub><b>Settings</b> — credentials, account, and app info</sub>
     </td>
   </tr>
