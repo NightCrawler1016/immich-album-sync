@@ -347,10 +347,12 @@ docker run -p 8080:8080 \
 ### Download Support Bundle
 
 In the **Live Logs** page, click **Download Support Bundle** to get a ZIP containing:
-- `sync.log` — full sync log
-- `jobs.json` — job configurations (API keys redacted)
+- `sync.log` — full sync log (server hostnames/IPs redacted)
+- `jobs.json` — job configurations (API keys redacted; URL hosts masked)
 - `sync_runs.json` — last 100 run records
 - `system_info.json` — Python version, immich-go version, paths
+
+> The bundle is safe to share for troubleshooting: API keys are removed, and server hostnames/IP addresses are masked in both the log and job configs.
 
 ### Common Issues
 
