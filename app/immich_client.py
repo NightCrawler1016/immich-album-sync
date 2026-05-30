@@ -91,12 +91,17 @@ class ImmichClient:
             # ── API key validity ─────────────────────────────────────────────
             # GET /api/users/me requires the user.read scope.
             # 401 = key is invalid or expired (hard stop).
-            # 403 = key is valid but lacks user.read — that scope is NOT required
-            #       for syncing; continue to check album.read / asset.read instead.
+            # 403 = key is valid but lacks user.read. For the SOURCE role that
+            #       scope is not needed, so we continue. For the DEST role it IS
+            #       needed — immich-go's connection validation calls this exact
+            #       endpoint and refuses to upload without user.read — so we flag
+            #       it as a dedicated requirement further below.
+            me_status: int | None = None
             try:
                 resp = await client.get(
                     f"{self.base_url}/api/users/me", headers=self.headers
                 )
+                me_status = resp.status_code
                 if resp.status_code == 401:
                     results.append({
                         "name": "API Key", "desc": "Valid, non-expired API key",
@@ -105,11 +110,13 @@ class ImmichClient:
                     })
                     return results, albums
                 elif resp.status_code == 403:
-                    # Valid key — user.read scope not granted, which is fine
+                    # Valid key — user.read scope not granted (handled per-role below)
+                    note = "user.read scope not required" if role == "source" \
+                        else "user.read scope checked below"
                     results.append({
                         "name": "API Key", "desc": "Valid, non-expired API key",
                         "ok": True,
-                        "detail": "authenticated (user.read scope not required)",
+                        "detail": f"authenticated ({note})",
                     })
                 else:
                     resp.raise_for_status()
@@ -256,6 +263,26 @@ class ImmichClient:
                     })
 
             if role == "dest":
+                # ── user.read (required by immich-go) ────────────────────────
+                # immich-go validates the destination connection via
+                # GET /api/users/me before uploading and aborts with
+                # "Missing required permission: user.read" on a 403.
+                if me_status == 403:
+                    results.append({
+                        "name": "user.read",
+                        "desc": "Required by the immich-go upload engine to connect",
+                        "ok": False,
+                        "detail": "Permission denied — enable user.read scope (immich-go "
+                                  "needs a full-access key on the destination)",
+                    })
+                else:
+                    results.append({
+                        "name": "user.read",
+                        "desc": "Required by the immich-go upload engine to connect",
+                        "ok": True,
+                        "detail": "Verified — destination connection will validate",
+                    })
+
                 # ── album.write ──────────────────────────────────────────────
                 created_id: str | None = None
                 try:
