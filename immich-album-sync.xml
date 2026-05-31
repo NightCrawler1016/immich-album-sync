@@ -32,11 +32,10 @@
   </Overview>
   <Category>Backup: MediaApp:Photos Status:Stable</Category>
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>
-  <!-- TemplateURL intentionally omitted — prevents Unraid from re-fetching
-       defaults from GitHub and overwriting user-configured settings.
-       To update the template manually, re-download from:
-       https://raw.githubusercontent.com/NightCrawler1016/immich-album-sync/main/immich-album-sync.xml -->
-  <TemplateURL></TemplateURL>
+  <!-- Canonical template URL. Required by Community Applications so the CA
+       pipeline can fetch, validate, and ship template updates. Your saved
+       container settings live in your own instance and are not overwritten. -->
+  <TemplateURL>https://raw.githubusercontent.com/NightCrawler1016/immich-album-sync/main/immich-album-sync.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/NightCrawler1016/immich-album-sync/main/icon.png</Icon>
   <ExtraParams>--restart unless-stopped</ExtraParams>
   <Description>
