@@ -360,3 +360,70 @@ class ImmichClient:
                         await f.write(chunk)
                         size += len(chunk)
                 return size
+
+    async def bulk_upload_check(self, items: list) -> dict:
+        """Ask this server which assets it already holds, keyed by SHA-1 checksum.
+
+        *items* is a list of ``{"id": <caller id>, "checksum": <base64 sha1>}``.
+        The base64 checksum is exactly what the Immich asset API returns for an
+        asset, and ``/api/assets/bulk-upload-check`` accepts it as-is (it detects
+        base64 vs hex by length), so no re-encoding is needed.
+
+        Returns ``{id: {"action": "accept"|"reject", "assetId": <existing id|None>}}``.
+        ``reject`` means the server already has that file; ``assetId`` is the id of
+        the existing copy (handy for adding it straight to an album).
+        """
+        if not items:
+            return {}
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{self.base_url}/api/assets/bulk-upload-check",
+                headers={**self.headers, "Content-Type": "application/json"},
+                json={"assets": [
+                    {"id": it["id"], "checksum": it["checksum"]} for it in items
+                ]},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        out: dict = {}
+        for r in data.get("results", []):
+            out[r.get("id")] = {
+                "action": r.get("action"),
+                "assetId": r.get("assetId"),
+            }
+        return out
+
+    async def create_album(self, album_name: str, asset_ids: Optional[list] = None) -> dict:
+        """Create an album, optionally seeding it with destination asset IDs."""
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{self.base_url}/api/albums",
+                headers={**self.headers, "Content-Type": "application/json"},
+                json={"albumName": album_name, "assetIds": asset_ids or []},
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def add_assets_to_album(self, album_id: str, asset_ids: list) -> int:
+        """Add destination asset IDs to an album (idempotent).
+
+        Returns the number now present in the album (newly added + already there).
+        Chunks large lists to stay within server request limits.
+        """
+        if not asset_ids:
+            return 0
+        present = 0
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for i in range(0, len(asset_ids), 500):
+                chunk = asset_ids[i:i + 500]
+                resp = await client.put(
+                    f"{self.base_url}/api/albums/{album_id}/assets",
+                    headers={**self.headers, "Content-Type": "application/json"},
+                    json={"ids": chunk},
+                )
+                resp.raise_for_status()
+                for item in resp.json():
+                    # success=True when newly added; error="duplicate" if already in album
+                    if item.get("success") or item.get("error") == "duplicate":
+                        present += 1
+        return present

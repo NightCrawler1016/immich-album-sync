@@ -176,7 +176,11 @@ async def run_sync_job(
             seen_ids.add(asset_id)
 
             filename = _safe_filename(asset.get("originalFileName"), f"{asset_id}.bin")
-            to_download.append({"id": asset_id, "filename": filename})
+            to_download.append({
+                "id": asset_id,
+                "filename": filename,
+                "checksum": asset.get("checksum"),
+            })
 
             # Fetch Live Photo companion (.MOV paired with .HEIC)
             live_video_id = asset.get("livePhotoVideoId")
@@ -191,6 +195,7 @@ async def run_sync_job(
                     to_download.append({
                         "id": live_video_id,
                         "filename": video_filename,
+                        "checksum": video_info.get("checksum"),
                         "live_companion": True,
                     })
                     sync_log.info(f"   Live   : Paired {filename} ↔ {video_filename}")
@@ -198,6 +203,57 @@ async def run_sync_job(
                     sync_log.warning(f"   Live   : Could not fetch companion for {filename}: {exc}")
 
         sync_log.info(f"   Queue  : {len(to_download)} files to process (incl. companions)")
+
+        # ------------------------------------------------------------------ #
+        # Step 2.5 — Skip assets the destination already has (checksum pre-check)
+        #
+        # Immich identifies duplicates by the SHA-1 of the original file. Before
+        # downloading anything, ask the destination which of these assets it
+        # already holds. Ones already present are added straight to the album via
+        # the API (no download, no upload); only genuinely-new assets are queued
+        # for download. This keeps re-syncs of an unchanged album nearly free on
+        # bandwidth and disk.
+        #
+        # Best-effort: if the check fails, fall back to downloading everything —
+        # immich-go still de-dupes on upload, so correctness never depends on it.
+        # ------------------------------------------------------------------ #
+        new_items = to_download
+        dest = ImmichClient(job.dest_url, dest_api_key)
+        checkable = [it for it in to_download if it.get("checksum")]
+        try:
+            if checkable:
+                check = await dest.bulk_upload_check(
+                    [{"id": it["id"], "checksum": it["checksum"]} for it in checkable]
+                )
+                existing_dest_ids: list[str] = []
+                filtered: list[dict] = []
+                for it in to_download:
+                    res = check.get(it["id"])
+                    if res and res.get("action") == "reject" and res.get("assetId"):
+                        existing_dest_ids.append(res["assetId"])
+                    else:
+                        filtered.append(it)
+                new_items = filtered
+
+                if existing_dest_ids:
+                    # Ensure those already-present assets are in the target album.
+                    dest_album = await dest.get_album_by_name(job.dest_album_name)
+                    if dest_album:
+                        await dest.add_assets_to_album(dest_album["id"], existing_dest_ids)
+                    else:
+                        await dest.create_album(job.dest_album_name, existing_dest_ids)
+                    results["assets_skipped"] += len(existing_dest_ids)
+                    sync_log.info(
+                        f"   Dedup  : {len(existing_dest_ids)} already on destination "
+                        f"— ensured in album, skipped download"
+                    )
+                sync_log.info(f"   New    : {len(new_items)} asset(s) need downloading")
+        except Exception as exc:
+            sync_log.warning(
+                f"   Dedup  : destination pre-check failed ({exc}); "
+                "downloading all and letting immich-go de-dupe"
+            )
+            new_items = to_download
 
         # ------------------------------------------------------------------ #
         # Steps 3+4+5 — Download and upload in rolling batches
@@ -231,9 +287,9 @@ async def run_sync_job(
         batch_files: list[Path] = []
         batch_bytes = 0
         batch_num = 0
-        total_items = len(to_download)
+        total_items = len(new_items)
 
-        for idx, item in enumerate(to_download):
+        for idx, item in enumerate(new_items):
             dest_file = files_dir / item["filename"]
             file_bytes = 0
 
@@ -343,12 +399,14 @@ async def run_sync_job(
             batch_bytes = 0
 
         results["assets_downloaded"] = downloaded
-        results["assets_skipped"] = skipped
+        # assets_skipped already holds the count skipped by the dedup pre-check;
+        # add the per-file cache hits (files already present locally) to it.
+        results["assets_skipped"] += skipped
         results["assets_failed"] = failed
         results["assets_uploaded"] = total_uploaded
 
         sync_log.info(
-            f"   Done   : {downloaded} new  |  {skipped} cached  |  "
+            f"   Done   : {downloaded} new  |  {results['assets_skipped']} skipped  |  "
             f"{failed} failed  |  {total_uploaded} uploaded"
         )
         if is_batching and batch_num > 1:
@@ -358,7 +416,8 @@ async def run_sync_job(
             )
         else:
             log(
-                f"Downloads complete — {downloaded} new, {skipped} already cached, "
+                f"Sync complete — {downloaded} downloaded, "
+                f"{results['assets_skipped']} skipped (already on destination), "
                 f"{total_uploaded} uploaded"
             )
 

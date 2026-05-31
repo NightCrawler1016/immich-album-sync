@@ -32,6 +32,7 @@ Immich A (private)  ──────────────▶  Immich B (pub
 - 📸 **Preserves originals** — downloads and uploads raw files with EXIF and GPS intact
 - 🍎 **Live Photo support** — automatically pairs `.HEIC` + `.MOV` files
 - 🔁 **Duplicate-safe** — uses `immich-go` for smart duplicate detection on the destination
+- ⚡ **Incremental & bandwidth-friendly** — checks the destination by checksum before downloading, so re-syncing an unchanged album transfers almost nothing
 - 📱 **Mobile-responsive** — works on phones, tablets, and desktops
 - 🚀 **Multi-job** — sync multiple albums with different schedules and servers
 - 🔍 **API permission checker** — test and verify required Immich API key permissions per job
@@ -302,11 +303,12 @@ With the default 10 GB limit, syncs under 10 GB behave exactly as before (single
 
 1. At the scheduled time, the sync engine connects to **Immich A** via its REST API
 2. Finds the configured source album by name and lists all assets (including Live Photo `.MOV` companions)
-3. Downloads original files to the local cache in rolling batches — once a batch reaches `BATCH_SIZE_MB` (default 10 GB) or `BATCH_FILE_COUNT`, it is immediately uploaded and cleared before the next batch begins
-4. Uploads each batch to **Immich B** using [`immich-go`](https://github.com/simulot/immich-go) (v0.31.0), which performs duplicate detection on the destination
-5. Logs all activity to `/app/appdata/logs/sync.log`, viewable live in the browser
+3. **Checksum pre-check** — asks **Immich B** which of those assets it already has (by SHA-1). Assets already present are added straight to the destination album via the API, with **no download or upload**; only genuinely-new assets continue to the next step
+4. Downloads the new originals to the local cache in rolling batches — once a batch reaches `BATCH_SIZE_MB` (default 10 GB) or `BATCH_FILE_COUNT`, it is immediately uploaded and cleared before the next batch begins
+5. Uploads each batch to **Immich B** using [`immich-go`](https://github.com/simulot/immich-go) (v0.31.0), which performs a second layer of duplicate detection on the destination
+6. Logs all activity to `/app/appdata/logs/sync.log`, viewable live in the browser
 
-Files already present in the cache are skipped on re-download. `immich-go` skips files already present on the destination. For albums under 10 GB the engine processes everything as a single batch — identical to a traditional download-then-upload flow.
+Re-syncing an unchanged album is nearly free: the checksum pre-check skips every already-synced asset before any bytes are transferred, so there is no wasted bandwidth or disk. The pre-check is best-effort — if it ever fails, the engine falls back to downloading everything and lets `immich-go` de-dupe on upload, so no asset is ever missed. Files already present in the cache are also skipped on re-download.
 
 ---
 
