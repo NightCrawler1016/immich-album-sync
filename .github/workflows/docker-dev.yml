@@ -41,12 +41,18 @@ jobs:
             type=raw,value=dev
             type=sha,prefix=dev-,format=short
 
+      - name: Determine app version
+        id: appver
+        run: echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            APP_VERSION=${{ steps.appver.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

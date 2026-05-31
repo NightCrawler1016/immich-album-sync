@@ -66,6 +66,11 @@ RUN chmod +x /entrypoint.sh
 # These are overridden when Unraid mounts the appdata volume.
 RUN mkdir -p /app/appdata/cache /app/appdata/logs
 
+# App version, injected at build time (CI passes the git tag, e.g. 1.2.3).
+# Placed late so it only busts the final layers, not the dependency layers.
+ARG APP_VERSION=1.0.0
+ENV APP_VERSION=${APP_VERSION}
+
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \

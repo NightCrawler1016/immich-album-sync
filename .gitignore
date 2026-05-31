@@ -43,3 +43,7 @@ cache/
 # OS
 .DS_Store
 Thumbs.db
+
+# Design source files (kept locally / in OneDrive, never pushed)
+*.psd
+screenshots/psd/
