@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<CommunityApplications>
+  <Profile>
+    Immich Album Sync — one-way album sync between two Immich servers, with a responsive web UI.
+
+    Built for users who run a private Immich server (full library) alongside a public or family-facing Immich server (curated albums only). Configure sync jobs, schedules, and API keys entirely through the browser. Supports Apple Live Photos, preserves originals/EXIF/GPS, uses immich-go for duplicate detection, and only transfers assets the destination does not already have.
+
+    Support is provided through the GitHub issues tracker.
+  </Profile>
+  <Icon>https://raw.githubusercontent.com/NightCrawler1016/immich-album-sync/main/icon.png</Icon>
+  <WebPage>https://github.com/NightCrawler1016/immich-album-sync</WebPage>
+</CommunityApplications>
