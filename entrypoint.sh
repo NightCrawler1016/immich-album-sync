@@ -12,11 +12,13 @@ PGID=${PGID:-100}
 
 # Tools that run as the unprivileged user (notably immich-go) need a writable
 # HOME for their cache/log dir — immich-go writes to $HOME/.cache and aborts
-# with "mkdir /.cache: permission denied" when HOME is unset/root-owned. Point
-# it at world-writable /tmp so it works regardless of PUID:PGID.
+# with "mkdir … permission denied" when that dir is unset or root-owned. Point
+# HOME at /tmp and pre-create + hand the cache dir to the runtime user so
+# immich-go can create its own subdirectory inside it.
 export HOME=/tmp
 export XDG_CACHE_HOME=/tmp/.cache
 mkdir -p /tmp/.cache
+chown "${PUID}:${PGID}" /tmp/.cache 2>/dev/null || true
 
 echo "========================================"
 echo " Immich Album Sync — Starting"
