@@ -49,12 +49,23 @@ jobs:
             # Commit SHA
             type=sha,prefix=,format=short
 
+      - name: Determine app version
+        id: appver
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=main-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            APP_VERSION=${{ steps.appver.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
