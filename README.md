@@ -160,6 +160,19 @@ Generate a strong key: [1Password Generator](https://1password.com/password-gene
 
 Sessions are signed with `SECRET_KEY` using `itsdangerous` and expire after 24 hours.
 
+### Runs as Non-Root
+
+The app process runs as an unprivileged user (`PUID:PGID`, default `99:100` = Unraid's `nobody:users`), **not root**. The container uses root only briefly at startup to fix data-directory ownership, then drops privileges. If your appdata is owned by a different user and you see permission errors, set `PUID`/`PGID` to match (see [Troubleshooting](#common-issues)).
+
+### Brute-Force & CSRF Protection
+
+- **Login rate limiting** — repeated failed logins from an IP are throttled (10 failures within 15 minutes triggers a 5-minute lockout).
+- **CSRF protection** — state-changing requests are rejected unless their `Origin`/`Referer` matches the app's own host, on top of a `SameSite=Lax` session cookie.
+
+### Safe Support Bundles
+
+The downloadable support bundle never contains API keys, and server hostnames/IP addresses are masked in both `sync.log` and the job configs — so it is safe to share for troubleshooting.
+
 ---
 
 ## Environment Variables
@@ -168,6 +181,8 @@ Sessions are signed with `SECRET_KEY` using `itsdangerous` and expire after 24 h
 |---|---|---|---|
 | `SECRET_KEY` | ✅ Yes | `change-me` | 32–64 char random string for session signing and API key encryption |
 | `TZ` | No | `UTC` | Container timezone (e.g. `America/New_York`) |
+| `PUID` | No | `99` | User ID the app runs as (non-root). `99` = Unraid `nobody` |
+| `PGID` | No | `100` | Group ID the app runs as. `100` = Unraid `users` |
 | `CLEANUP_CACHE` | No | `false` | Delete cached files after final upload (`true`/`false`) |
 | `CACHE_PATH` | No | `/app/appdata/cache` | Download cache directory (see [Cache on external storage](#cache-on-external-storage-or-a-different-disk)) |
 | `BATCH_SIZE_MB` | No | `10240` | Max MB to stage before uploading a batch (0 = unlimited) |
