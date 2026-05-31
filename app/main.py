@@ -47,6 +47,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger(__name__)
 
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me-to-something-random-and-long")
+# App version. Overridable at build/run time (e.g. baked from a git tag) via
+# the APP_VERSION env var; falls back to this default otherwise.
+APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 
 app = FastAPI(title="Immich Album Sync", docs_url=None, redoc_url=None)
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=86400)  # 24 h
@@ -93,6 +96,7 @@ app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
 
 # Jinja2 global helpers
 templates.env.globals["now"] = datetime.utcnow
+templates.env.globals["app_version"] = APP_VERSION
 templates.env.filters["datetimefmt"] = lambda dt, fmt="%Y-%m-%d %H:%M": (
     dt.strftime(fmt) if dt else "—"
 )
