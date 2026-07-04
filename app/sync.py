@@ -18,6 +18,30 @@ logger = logging.getLogger(__name__)
 CACHE_BASE = os.getenv("CACHE_PATH", "/app/appdata/cache")
 LOG_PATH = os.getenv("LOG_PATH", "/app/appdata/logs/sync.log")
 
+# --------------------------------------------------------------------------- #
+# In-flight guard
+#
+# Prevents two runs of the SAME job from executing at once — a manual "Run now"
+# colliding with a scheduled fire, or two rapid clicks. Both paths write into
+# the shared cache dir (job_{id}/files) and clear it, so overlap causes
+# truncated/double uploads and wrong counts. asyncio is single-threaded, so a
+# check-then-add with no await in between is atomic; no lock object is needed.
+# --------------------------------------------------------------------------- #
+_active_job_ids: set = set()
+
+
+def try_acquire_job(job_id: int) -> bool:
+    """Reserve *job_id* for a run. Returns False if a run is already in flight."""
+    if job_id in _active_job_ids:
+        return False
+    _active_job_ids.add(job_id)
+    return True
+
+
+def release_job(job_id: int) -> None:
+    """Release the in-flight reservation for *job_id* (safe if not held)."""
+    _active_job_ids.discard(job_id)
+
 # Batch processing limits — prevent cache overflow during large first-time syncs.
 # Files are downloaded into the cache until a limit is hit, then uploaded and cleared
 # before the next batch begins. 0 = unlimited for that dimension.

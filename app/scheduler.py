@@ -108,10 +108,11 @@ async def _scheduled_sync_runner(job_id: int):
     """APScheduler calls this coroutine at each scheduled time."""
     from .database import SessionLocal
     from .models import SyncJob, SyncRun
-    from .sync import run_sync_job
+    from .sync import release_job, run_sync_job, try_acquire_job
 
     db = SessionLocal()
     run = None
+    acquired = False
     try:
         job = db.query(SyncJob).filter(
             SyncJob.id == job_id, SyncJob.enabled == True  # noqa: E712
@@ -119,6 +120,15 @@ async def _scheduled_sync_runner(job_id: int):
 
         if not job:
             logger.warning(f"Scheduled job {job_id} not found or disabled — skipping")
+            return
+
+        # Skip this fire if a run (manual or a previous overrun) is still active,
+        # so we never run two syncs of the same job over the shared cache dir.
+        acquired = try_acquire_job(job_id)
+        if not acquired:
+            logger.info(
+                f"Scheduled job {job_id} skipped — a run is already in progress"
+            )
             return
 
         logger.info(f"Scheduled run starting for job {job_id} '{job.name}'")
@@ -156,4 +166,6 @@ async def _scheduled_sync_runner(job_id: int):
             except Exception:
                 pass
     finally:
+        if acquired:
+            release_job(job_id)
         db.close()
