@@ -27,6 +27,8 @@
     - Preserves original files, EXIF, GPS, and Apple Live Photos (.HEIC + .MOV)
     - Duplicate-safe (uses immich-go for smart detection)
     - Real-time log streaming in the browser
+    - Run history with a 30-day (configurable) window, filterable by job and status
+    - Webhook notifications on sync start/success/failure (Discord, Slack, or any JSON endpoint)
     - Mobile-responsive design
     - Add-only mode by default (safe for family sharing)
   </Overview>

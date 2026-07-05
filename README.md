@@ -37,6 +37,7 @@ Immich A (private)  ──────────────▶  Immich B (pub
 - 🚀 **Multi-job** — sync multiple albums with different schedules and servers
 - 🔍 **API permission checker** — test and verify required Immich API key permissions per job
 - 🔔 **Webhook notifications** — get pinged on sync start/success/partial/failure; generic JSON that auto-formats for Discord & Slack, global or per-job
+- 📜 **Run history** — browse every sync over the last 30 days (or any window) and filter by job and status to pin down failures
 - 📦 **Support bundle** — one-click download of logs, sanitized config, and run history for troubleshooting
 
 ---
