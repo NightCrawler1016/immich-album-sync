@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Run History — Immich Album Sync{% endblock %}
+
+{% block content %}
+<div class="p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">
+
+  <div class="mb-6">
+    <h1 class="text-xl font-bold text-white">Run History</h1>
+    <p class="text-sm text-gray-400 mt-0.5">Every sync run in the selected window — filter by status to find failures.</p>
+  </div>
+
+  <!-- Filters (GET; auto-submit on change) -->
+  <form method="get" action="/history" class="flex flex-wrap items-end gap-3 mb-5">
+    <div>
+      <label for="days" class="block text-xs text-gray-500 mb-1">Time range</label>
+      <select id="days" name="days" onchange="this.form.submit()"
+              class="px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-sky-500">
+        {% for d in day_options %}
+        <option value="{{ d }}" {% if d == days %}selected{% endif %}>{% if d == 0 %}All time{% else %}Last {{ d }} day{{ 's' if d != 1 else '' }}{% endif %}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label for="job" class="block text-xs text-gray-500 mb-1">Job</label>
+      <select id="job" name="job" onchange="this.form.submit()"
+              class="px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-sky-500">
+        <option value="">All jobs</option>
+        {% for j in jobs %}
+        <option value="{{ j.id }}" {% if j.id == job_id %}selected{% endif %}>{{ j.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label for="status" class="block text-xs text-gray-500 mb-1">Status</label>
+      <select id="status" name="status" onchange="this.form.submit()"
+              class="px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-sky-500">
+        <option value="all" {% if status == 'all' %}selected{% endif %}>All statuses</option>
+        {% for s in statuses %}
+        <option value="{{ s }}" {% if s == status %}selected{% endif %}>{{ s|capitalize }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <noscript><button type="submit" class="px-4 py-2 bg-sky-500 text-white text-sm rounded-lg">Apply</button></noscript>
+  </form>
+
+  <!-- Summary chips for the window (independent of the status filter) -->
+  <div class="flex flex-wrap gap-2 mb-5 text-sm">
+    <span class="px-3 py-1.5 rounded-lg bg-gray-900 border border-gray-800 text-gray-400">Total <b class="text-white ml-1">{{ counts.total }}</b></span>
+    <span class="px-3 py-1.5 rounded-lg bg-gray-900 border border-gray-800 text-gray-400">Failed <b class="ml-1 {% if counts.failed %}text-red-400{% else %}text-gray-400{% endif %}">{{ counts.failed }}</b></span>
+    <span class="px-3 py-1.5 rounded-lg bg-gray-900 border border-gray-800 text-gray-400">Partial <b class="ml-1 {% if counts.partial %}text-orange-400{% else %}text-gray-400{% endif %}">{{ counts.partial }}</b></span>
+    <span class="px-3 py-1.5 rounded-lg bg-gray-900 border border-gray-800 text-gray-400">Success <b class="ml-1 text-green-400">{{ counts.success }}</b></span>
+  </div>
+
+  {% if runs %}
+  <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="text-xs text-gray-500 uppercase tracking-wide border-b border-gray-800">
+            <th class="text-left px-4 py-3">Job</th>
+            <th class="text-left px-4 py-3 whitespace-nowrap">Started</th>
+            <th class="text-left px-4 py-3">Status</th>
+            <th class="text-right px-4 py-3 hidden sm:table-cell">Uploaded</th>
+            <th class="text-right px-4 py-3 hidden md:table-cell">Failed</th>
+            <th class="text-right px-4 py-3 hidden lg:table-cell">Duration</th>
+            <th class="text-left px-4 py-3 hidden lg:table-cell">Detail</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-800">
+          {% for run in runs %}
+          <tr class="hover:bg-gray-800/50 align-top">
+            <td class="px-4 py-3 text-gray-300 max-w-[160px] truncate">{{ run._job_name }}</td>
+            <td class="px-4 py-3 text-gray-500 whitespace-nowrap">{{ run.started_at | datetimefmt }}</td>
+            <td class="px-4 py-3">
+              <span class="badge-{{ run.status }} text-xs px-2 py-0.5 rounded-full font-medium">{{ run.status }}</span>
+            </td>
+            <td class="px-4 py-3 text-right text-gray-400 hidden sm:table-cell">{{ run.assets_uploaded }}</td>
+            <td class="px-4 py-3 text-right hidden md:table-cell {% if run.assets_failed %}text-red-400{% else %}text-gray-500{% endif %}">{{ run.assets_failed }}</td>
+            <td class="px-4 py-3 text-right text-gray-500 hidden lg:table-cell whitespace-nowrap">{% if run.duration_seconds is not none %}{{ run.duration_seconds }}s{% else %}—{% endif %}</td>
+            <td class="px-4 py-3 text-gray-500 hidden lg:table-cell max-w-[280px] truncate" title="{{ run.error_message or '' }}">{{ run.error_message or '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {% if truncated %}
+  <p class="text-xs text-gray-500 mt-3">
+    Showing the most recent {{ shown }} of {{ total_matching }} matching runs. Narrow the time range, job, or status to see the rest.
+  </p>
+  {% else %}
+  <p class="text-xs text-gray-500 mt-3">Showing all {{ shown }} matching run{{ 's' if shown != 1 else '' }}.</p>
+  {% endif %}
+
+  {% else %}
+  <div class="text-center py-16 bg-gray-900 border border-dashed border-gray-700 rounded-2xl">
+    <p class="text-gray-400 font-medium mb-1">No runs match these filters</p>
+    <p class="text-gray-600 text-sm">Try a wider time range or a different status.</p>
+  </div>
+  {% endif %}
+
+</div>
+{% endblock %}

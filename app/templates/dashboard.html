@@ -134,7 +134,10 @@
 
   <!-- Recent runs -->
   {% if recent_runs %}
-  <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">Recent Runs</h2>
+  <div class="flex items-center justify-between mb-3">
+    <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wide">Recent Runs</h2>
+    <a href="/history" class="text-xs text-sky-400 hover:text-sky-300">View full history →</a>
+  </div>
   <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
     <div class="overflow-x-auto">
       <table class="w-full text-sm">

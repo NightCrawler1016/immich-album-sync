@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Index, Text
 from sqlalchemy.orm import relationship
 from .database import Base
 
@@ -48,11 +48,14 @@ class SyncJob(Base):
 
 class SyncRun(Base):
     __tablename__ = "sync_runs"
+    # History queries order/filter by started_at (and by job); index both so the
+    # table stays fast even under a 5-minute job that produces thousands of rows.
+    __table_args__ = (Index("ix_sync_runs_job_started", "job_id", "started_at"),)
 
     id = Column(Integer, primary_key=True, index=True)
     job_id = Column(Integer, ForeignKey("sync_jobs.id"), nullable=False)
 
-    started_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, default=datetime.utcnow, index=True)
     finished_at = Column(DateTime, nullable=True)
     status = Column(String(50), default="running")  # running | success | partial | failed
 
