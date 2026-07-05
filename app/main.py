@@ -34,6 +34,7 @@ from .models import Settings, SyncJob, SyncRun
 from .scheduler import (
     get_next_run_time,
     init_scheduler,
+    prune_run_history,
     remove_job,
     schedule_job,
 )
@@ -212,6 +213,10 @@ async def startup():
 
     init_db()
     init_scheduler()
+
+    # One-time run-history cleanup at boot (then daily via the scheduler), so an
+    # accumulated backlog is trimmed immediately after an upgrade.
+    prune_run_history()
 
     # Re-schedule all enabled jobs that survived a restart
     from .database import SessionLocal

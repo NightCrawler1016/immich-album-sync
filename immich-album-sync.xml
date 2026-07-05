@@ -199,4 +199,15 @@ This lets you route multi-GB or multi-TB downloads to a large array disk or NAS 
     Required="false"
     Mask="false">/app/appdata/config.db</Config>
 
+  <Config
+    Name="Run History Retention (days)"
+    Target="RUN_HISTORY_RETENTION_DAYS"
+    Default="90"
+    Mode=""
+    Description="How many days of sync run history to keep. Older runs are pruned automatically once a day; the 10 most recent runs of each job are always kept regardless of age. Default: 90 (matches the widest filter on the Run History page). Set to 0 to keep all history forever (the database will grow over time, especially with frequent schedules)."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false">90</Config>
+
 </Container>
