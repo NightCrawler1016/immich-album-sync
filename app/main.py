@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -471,6 +471,90 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
             "total_jobs": len(jobs),
             "enabled_jobs": sum(1 for j in jobs if j.enabled),
             "recent_runs": recent_runs,
+        },
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Run history
+#
+# The dashboard "Recent Runs" widget only shows the latest 10, so a frequent
+# job (e.g. */5) quickly buries older failures. This page shows every run in a
+# selectable window (default 30 days) filterable by job and status, with a row
+# cap so a chatty schedule can't render tens of thousands of rows at once.
+# --------------------------------------------------------------------------- #
+
+_HISTORY_MAX_ROWS = 500
+_HISTORY_DAY_OPTIONS = (1, 7, 30, 90, 0)  # 0 = all time
+_RUN_STATUSES = ("success", "partial", "failed", "running")
+
+
+@app.get("/history", response_class=HTMLResponse)
+async def history(request: Request, db: Session = Depends(get_db)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse("/change-password", status_code=302)
+
+    qp = request.query_params
+    try:
+        days = int(qp.get("days", 30))
+    except (TypeError, ValueError):
+        days = 30
+    if days not in _HISTORY_DAY_OPTIONS:
+        days = 30
+
+    status = qp.get("status", "all")
+    if status not in _RUN_STATUSES:
+        status = "all"
+
+    job_id = None
+    if qp.get("job"):
+        try:
+            job_id = int(qp.get("job"))
+        except (TypeError, ValueError):
+            job_id = None
+
+    # Base query = time window + optional job (NOT status). Reused for the
+    # summary counts and, after adding the status filter, the row list.
+    base = db.query(SyncRun)
+    if days > 0:
+        base = base.filter(SyncRun.started_at >= datetime.utcnow() - timedelta(days=days))
+    if job_id is not None:
+        base = base.filter(SyncRun.job_id == job_id)
+
+    counts = {
+        "total": base.count(),
+        "failed": base.filter(SyncRun.status == "failed").count(),
+        "partial": base.filter(SyncRun.status == "partial").count(),
+        "success": base.filter(SyncRun.status == "success").count(),
+    }
+
+    rows_q = base if status == "all" else base.filter(SyncRun.status == status)
+    total_matching = rows_q.count()
+    runs = rows_q.order_by(SyncRun.started_at.desc()).limit(_HISTORY_MAX_ROWS).all()
+
+    # Attach job names via one lookup (avoids a lazy query per row).
+    jobs = db.query(SyncJob).order_by(SyncJob.name).all()
+    name_by_id = {j.id: j.name for j in jobs}
+    for run in runs:
+        run._job_name = name_by_id.get(run.job_id, "Unknown")
+
+    return templates.TemplateResponse(
+        "history.html",
+        {
+            "request": request,
+            "runs": runs,
+            "jobs": jobs,
+            "counts": counts,
+            "days": days,
+            "status": status,
+            "job_id": job_id,
+            "total_matching": total_matching,
+            "shown": len(runs),
+            "truncated": total_matching > len(runs),
+            "day_options": _HISTORY_DAY_OPTIONS,
+            "statuses": _RUN_STATUSES,
         },
     )
 

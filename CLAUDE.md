@@ -88,7 +88,8 @@ return `401` instead of redirecting.
 | `/login` | GET/POST | Login; rate-limited; sets session | public |
 | `/logout` | GET | `session.clear()` | any |
 | `/change-password` | GET/POST | Forced first-login change | login |
-| `/` | GET | Dashboard | login + pw-change gate |
+| `/` | GET | Dashboard (10 most-recent runs) | login + pw-change gate |
+| `/history` | GET | Run history: window (`?days=`, default 30, `0`=all) + `?job=`/`?status=` filters, 500-row cap | login + gate |
 | `/jobs` | GET | Job list | login + gate |
 | `/jobs/new` | GET/POST | Create job | login |
 | `/jobs/{id}/edit` | GET/POST | Edit job (blank key = keep existing) | login |
@@ -303,7 +304,10 @@ if you change the code, keep the claim honest:
 - `http://` server URLs accepted with no warning → API key sent cleartext. (TLS verify is
   correctly **on** for `https://` — don't add an insecure toggle.)
 - CI actions pinned by mutable tag, not commit SHA.
-- `sync_runs` table and `sync.log` both grow unbounded (no retention/rotation).
+- `sync_runs` table and `sync.log` both grow unbounded (no retention/rotation). The
+  run-history queries are now indexed (`ix_sync_runs_started_at`, `ix_sync_runs_job_started`)
+  so reads stay fast, but nothing prunes old rows — a `*/5` job writes ~8.6k rows/month.
+  A retention prune (keep N days / N per job) is still a good follow-up.
 - Same-`originalFileName` assets collide in cache (one silently skipped) — namespace the
   cache filename with the asset id.
 - `decrypt_secret` swallows all exceptions and returns ciphertext as if plaintext; invalid

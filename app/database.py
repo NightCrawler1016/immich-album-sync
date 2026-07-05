@@ -59,6 +59,15 @@ def _migrate_schema():
                 conn.exec_driver_sql(f"ALTER TABLE sync_jobs ADD COLUMN {col} {ddl}")
                 logger.info(f"Schema migration: added column sync_jobs.{col}")
 
+        # Indexes for the run-history queries (create_all only adds these to a
+        # freshly-created table; existing databases need them explicitly).
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_sync_runs_started_at ON sync_runs (started_at)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_sync_runs_job_started ON sync_runs (job_id, started_at)"
+        )
+
 
 def init_db():
     """Create all tables and seed default admin credentials."""
