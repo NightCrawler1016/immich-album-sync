@@ -142,10 +142,12 @@ _scheduled_sync_runner`) and the "Run now" button (`main.py::_run_background` vi
 ## SECRET_KEY (the one env var that matters)
 
 - `SECRET_KEY` signs session cookies **and** derives the Fernet key that encrypts API
-  keys. Default is `change-me-to-something-random-and-long`.
-- On startup the app only **warns** about a default/short/over-long key — it does not
-  refuse to boot. With the default key, stored API keys are effectively readable by
-  anyone who knows that public default string.
+  keys. The placeholder in code/template/compose is
+  `change-me-to-a-unique-random-32-64-char-string`.
+- **Startup refuses to boot** (`main.py` `startup()` raises `RuntimeError`) if the key is
+  unset, begins with `change-me` (any placeholder, case-insensitive), or is under 16
+  chars. This is the guard that keeps the public default from ever being used. 16–31 chars
+  boots with a warning; 32–128 is the recommended range.
 - Changing `SECRET_KEY` invalidates all stored API keys (can't decrypt) and logs out all
   sessions. This is documented in README + the Unraid template — keep those in sync if
   the behavior changes.
@@ -206,10 +208,11 @@ but **not** currently documented in README/XML).
 The README's "Security" section makes concrete promises. Each is implemented as noted —
 if you change the code, keep the claim honest:
 
-- **Forced first-login change** — enforced on GET app pages via the
-  `must_change_password` session flag; default password `admin` is blocked from reuse
-  (min 8 chars). Note: the state-changing POST/API endpoints only check `_logged_in`, not
-  the pw-change gate (low impact — the actor is the already-authenticated admin).
+- **Forced first-login change** — enforced app-wide by the `_auth_gate` dependency
+  (`main.py`, wired via `FastAPI(dependencies=[...])`): every non-public route (all
+  POST/`/api/*`/`/logs/*` included) requires a session AND blocks until the change is done.
+  Default password `admin` is blocked from reuse (min 8 chars). *(Fixed 2026-07 — this used
+  to be enforced only on GET pages, so POST/API routes could bypass it.)*
 - **API-key encryption** — Fernet (AES-128-CBC + HMAC), key from SECRET_KEY. Keys are
   never rendered into HTML (forms post blank = "keep existing"; edit shows a "stored"
   indicator). `crypto.encrypt/decrypt` **fail open to plaintext** if the `cryptography`
@@ -217,57 +220,50 @@ if you change the code, keep the claim honest:
   it means "encrypted at rest" depends on the package being present and SECRET_KEY being
   stable.
 - **Sessions** — signed cookie, `max_age=86400` (24h). Cookie is **not** marked `Secure`
-  (fine on plain-HTTP LAN; relevant if fronted by HTTPS).
+  (fine on plain-HTTP LAN; relevant if fronted by HTTPS — still open, see below).
 - **Login rate limiting** — in-memory per-IP, 10 fails / 15 min → 5-min lockout. Resets
   on restart; behind a reverse proxy all clients share the proxy IP unless real IPs are
   forwarded (there's no `X-Forwarded-For` handling — `request.client.host` is used).
 - **CSRF** — `csrf_protect` middleware compares `Origin` (then `Referer`) host to the
-  `Host` header on unsafe methods; **fails open when both headers are absent**, backed by
-  the `SameSite=Lax` cookie. No CSRF token.
+  `Host` header on unsafe methods and **fails closed** (rejects when neither header is
+  present or the host mismatches), backed by the `SameSite=Lax` cookie. No CSRF token.
+  *(Fixed 2026-07 — used to fail open on missing headers.)*
 - **Non-root** — `entrypoint.sh` starts as root, fixes ownership, `gosu`-drops to
   PUID:PGID before uvicorn.
 - **Safe support bundle** — `/logs/support-bundle` redacts API keys (`[redacted]`) and
   masks URL hosts + bare IPv4 in both `sync.log` and job configs. IPv6 addresses are
   **not** masked by the current regexes.
 
-### Known sharp edges (from the 2026-07 verified review — not yet fixed)
+### Security review status (verified review, 2026-07)
 
-Ordered by priority. All are observable in the current source; fix before the next public
-release and keep the README's security claims honest as you go.
+**Fixed and shipped to `:latest` (commit `36da370`)**
+- ✅ **`must_change_password` bypass** — closed via the app-wide `_auth_gate` dependency.
+- ✅ **Default/weak `SECRET_KEY`** — startup now refuses to boot on any `change-me*`
+  placeholder / unset / <16-char key (was warn-only).
+- ✅ **Per-job concurrency** — `try_acquire_job`/`release_job` guard (`sync.py`); manual run
+  returns 409, cron fire skips, so no two runs share `job_{id}/files`.
+- ✅ **CSRF fail-open** — now fails closed on missing/mismatched `Origin`/`Referer`.
+- ✅ **Interrupted runs stuck `running`** — reconciled to `failed` on startup.
 
-**High**
-- **`must_change_password` gate is bypassable.** It's only enforced on GET page routes;
-  every POST/`/api/*`/`/logs/*` route checks `_logged_in` only. A fresh deploy's `admin/admin`
-  session can POST to `/jobs/new`, `/api/test-connection`, etc. without ever setting a
-  password. Fix: one `require_active_user` dependency (session + not-must-change) on all
-  non-public routes.
-- **Default `SECRET_KEY` only warns, never refuses to boot** (`main.py:136`). The default is
-  a public constant in this repo, and it both signs sessions *and* derives the Fernet key,
-  so a default deploy allows session forgery and decryption of stored API keys. Fix: refuse
-  to start (or auto-generate + persist a random key to appdata) when key is default/too short.
-- **No per-job run lock.** Manual "Run now" (`_run_background`) and cron
-  (`_scheduled_sync_runner`) can run the same job concurrently over the shared
-  `job_{id}/files` cache → truncated/double uploads, wrong counts. Fix: per-job lock/DB
-  in-flight check, and/or make the cache dir per-run (`job_{id}/run_{run_id}/`).
+**Still open — Medium (safe to do; no UX trade-off)**
+- **immich-go gets the API key as `--api-key` argv** (`sync.py` `_run_immich_go_upload`) →
+  readable via `/proc`. Pass via child-process env instead. **This currently makes the
+  README's "keys decrypted only in memory at sync time" claim untrue — fix the code or
+  soften the README.**
+- **Dockerfile downloads immich-go + gosu with no checksum/signature check** (`Dockerfile`).
+  Pin SHA-256 per arch and `sha256sum -c` before install.
+- **Support-bundle redaction (`_redact_text`) masks hosts/IPv4 but not API-key tokens** and
+  not IPv6; if immich-go ever echoes the key it lands in the shareable `sync.log`. **This
+  makes the README's "support bundle never contains API keys" claim not fully guaranteed.**
+  Do an exact-string replace of the known key value at log-write time.
 
-**Medium**
-- **Session cookie not `Secure`** (`main.py:55`, starlette default `https_only=False`) — add
-  `https_only`/`SESSION_COOKIE_SECURE` (gate for plain-HTTP LAN if needed).
+**Still open — Medium (needs a decision — interacts with plain-HTTP LAN use)**
+- **Session cookie not `Secure`** (starlette default `https_only=False`) — add
+  `https_only`/`SESSION_COOKIE_SECURE`, but gate it so plain-HTTP LAN deploys still work.
 - **Password change doesn't invalidate old sessions** — cookies are stateless `{user}`; add a
   credential-version in the session payload and bump it on password change.
-- **immich-go gets the API key as `--api-key` argv** (`sync.py:460`) → readable via `/proc`.
-  Pass via child-process env instead. (Also contradicts the README's "only in memory" claim.)
-- **CSRF fails open when both `Origin` and `Referer` are absent** (`main.py:76`) — non-browser
-  clients skip the check; only `SameSite=Lax` remains. Fail closed on unsafe methods.
-- **Dockerfile downloads immich-go + gosu with no checksum/signature check** (`Dockerfile:29`).
-  Pin SHA-256 per arch and `sha256sum -c` before install.
-- **Interrupted runs stay `status="running"` forever** — on startup, mark stale `running`
-  SyncRuns as `failed` (also needed for any DB-based run lock).
-- **Support-bundle redaction (`_redact_text`) masks hosts/IPv4 but not API-key tokens** and
-  not IPv6; if immich-go ever echoes the key it lands in the shareable `sync.log`. Do an
-  exact-string replace of the known key value at log-write time.
 
-**Low / polish**
+**Still open — Low / polish**
 - Rate limiter keys on `request.client.host` → collapses to one bucket (and a DoS lever)
   behind a reverse proxy; no `X-Forwarded-For` handling.
 - `download_original` has no per-asset size ceiling — a hostile source can fill the disk.
