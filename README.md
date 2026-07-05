@@ -36,6 +36,7 @@ Immich A (private)  ──────────────▶  Immich B (pub
 - 📱 **Mobile-responsive** — works on phones, tablets, and desktops
 - 🚀 **Multi-job** — sync multiple albums with different schedules and servers
 - 🔍 **API permission checker** — test and verify required Immich API key permissions per job
+- 🔔 **Webhook notifications** — get pinged on sync start/success/partial/failure; generic JSON that auto-formats for Discord & Slack, global or per-job
 - 📦 **Support bundle** — one-click download of logs, sanitized config, and run history for troubleshooting
 
 ---
@@ -244,7 +245,7 @@ services:
 | Sync Jobs | `/jobs` | List, create, edit, delete, and pause sync jobs |
 | New Job | `/jobs/new` | Configure source server, destination server, album, and schedule |
 | Live Logs | `/logs` | Real-time streaming sync log with copy and support bundle download |
-| Settings | `/settings` | Change username and password |
+| Settings | `/settings` | Change username and password; configure notifications |
 
 ---
 
@@ -270,6 +271,47 @@ services:
 > **Destination note:** Uploads run through [immich-go](https://github.com/simulot/immich-go), which requires a broad set of scopes and validates the connection via `GET /api/users/me` (so `user.read` is mandatory here). Its documented requirements include `user.read`, `asset.read`, `asset.statistics`, `asset.update`, `asset.upload`, `asset.copy`, `asset.replace`, `asset.delete`, `asset.download`, `album.create`, `album.read`, `albumAsset.create`, `server.about`, `stack.create`, `tag.asset`, and `tag.create`. Because this set changes between immich-go versions, the simplest reliable choice is an **all-permissions API key** on the destination. A narrowly-scoped key fails with `Missing required permission: …`. For family sharing, create a dedicated non-admin user on the destination and use *their* all-permissions key.
 
 See [Immich API Key documentation](https://docs.immich.app/features/command-line-interface/#obtain-the-api-key) for how to create keys with specific permissions.
+
+---
+
+## Notifications
+
+Get notified when a sync runs — configured entirely in the browser under **Settings → Notifications**. No environment variables needed.
+
+### How it works
+
+- **One webhook URL.** Paste any URL that accepts a JSON `POST`. If it's a **Discord** or **Slack** incoming-webhook URL, the message is auto-formatted (Discord embeds with a color per status; Slack attachments). Any other URL receives a plain JSON body you can route however you like.
+- **Pick your events.** Choose any of **Run started**, **Successful runs**, **Partial (some errors)**, and **Failed runs**. A common low-noise choice is just *Failed* + *Partial*.
+- **Global default + per-job override.** The Settings page sets the default for every job. On a job's edit page you can leave it on **Use global settings**, turn it **Off** for that job, or set a **Custom** webhook/events just for that job.
+- **Test button.** "Send test notification" posts a sample message so you can confirm the URL works before relying on it.
+
+### Security & privacy
+
+- Webhook URLs are **encrypted at rest** (same Fernet scheme as API keys) and are never rendered back into the page — the field shows "Saved securely" and stays blank; leave it blank to keep the current URL.
+- Notification payloads **never contain secrets** — no API keys, no server URLs (only the job name, album names, run counts, status, timestamps, and, for failures, the error message).
+- A notification failure can never break a sync — the worst case is a warning in the log.
+
+### Generic JSON payload
+
+Non-Discord/Slack endpoints receive:
+
+```json
+{
+  "service": "immich-album-sync",
+  "event": "failed",
+  "status": "failed",
+  "job": "Family Shared Sync",
+  "source_album": "Family Shared",
+  "dest_album": "Family Shared",
+  "message": "Family Shared Sync: Sync failed",
+  "counts": { "found": 12, "downloaded": 0, "uploaded": 0, "skipped": 0, "failed": 12 },
+  "error": "Album 'Family Shared' not found on the source server.",
+  "started_at": "2026-07-04T02:00:00+00:00",
+  "finished_at": "2026-07-04T02:00:07+00:00",
+  "duration_seconds": 7,
+  "timestamp": "2026-07-04T02:00:07+00:00"
+}
+```
 
 ---
 

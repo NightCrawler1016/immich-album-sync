@@ -106,11 +106,13 @@ def get_next_run_time(job_id: int) -> Optional[datetime]:
 
 async def _scheduled_sync_runner(job_id: int):
     """APScheduler calls this coroutine at each scheduled time."""
+    from . import notify
     from .database import SessionLocal
     from .models import SyncJob, SyncRun
     from .sync import release_job, run_sync_job, try_acquire_job
 
     db = SessionLocal()
+    job = None
     run = None
     acquired = False
     try:
@@ -139,6 +141,8 @@ async def _scheduled_sync_runner(job_id: int):
         db.commit()
         db.refresh(run)
 
+        await notify.notify(db, job, "start", run=run)
+
         results = await run_sync_job(job)
 
         run.finished_at = datetime.utcnow()
@@ -155,6 +159,9 @@ async def _scheduled_sync_runner(job_id: int):
 
         logger.info(f"Scheduled job {job_id} finished — status={results['status']}")
 
+        event = notify.STATUS_TO_EVENT.get(results["status"], "success")
+        await notify.notify(db, job, event, results=results, run=run)
+
     except Exception as exc:
         logger.error(f"Unhandled error in scheduled job {job_id}: {exc}")
         if run:
@@ -165,6 +172,12 @@ async def _scheduled_sync_runner(job_id: int):
                 db.commit()
             except Exception:
                 pass
+        if job:
+            await notify.notify(
+                db, job, "failed",
+                results={"status": "failed", "error_message": str(exc)},
+                run=run,
+            )
     finally:
         if acquired:
             release_job(job_id)

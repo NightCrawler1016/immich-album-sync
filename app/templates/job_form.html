@@ -307,6 +307,60 @@
       </div>
     </div>
 
+    <!-- Notifications (per-job) -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-sm font-semibold text-gray-200 mb-1">Notifications</h2>
+      <p class="text-xs text-gray-500 mb-4">Send a webhook when this job runs.</p>
+
+      <div>
+        <label for="notify_override" class="block text-sm font-medium text-gray-300 mb-1.5">Mode</label>
+        <select id="notify_override" name="notify_override" onchange="toggleNotifyCustom()"
+                class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-sky-500">
+          <option value="inherit" {% if not job or not job.notify_override or job.notify_override == 'inherit' %}selected{% endif %}>Use global settings</option>
+          <option value="off" {% if job and job.notify_override == 'off' %}selected{% endif %}>Off — never notify for this job</option>
+          <option value="custom" {% if job and job.notify_override == 'custom' %}selected{% endif %}>Custom — job-specific webhook</option>
+        </select>
+        <p class="text-xs text-gray-500 mt-1">"Use global settings" follows the webhook on the Settings page.</p>
+      </div>
+
+      <div id="notifyCustomFields" class="space-y-4 mt-4 hidden">
+        <div>
+          <label for="webhook_url" class="block text-sm font-medium text-gray-300 mb-1.5">
+            Webhook URL
+            {% if job and has_job_webhook %}
+            <span class="ml-2 text-xs text-green-500 font-normal">● Saved securely</span>
+            {% endif %}
+          </label>
+          {# SECURITY: never render the stored URL — blank on submit keeps the existing one. #}
+          <input id="webhook_url" name="webhook_url" type="password" value=""
+                 placeholder="{% if job and has_job_webhook %}Leave blank to keep current URL{% else %}https://discord.com/api/webhooks/…{% endif %}"
+                 autocomplete="new-password"
+                 class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"/>
+          <p class="text-xs text-gray-500 mt-1">Discord/Slack URLs are auto-formatted. Stored encrypted at rest.</p>
+        </div>
+        <div>
+          <p class="block text-sm font-medium text-gray-300 mb-2">Notify on</p>
+          <div class="grid grid-cols-2 gap-2">
+            {% for ev, label in [('failed','Failed runs'),('partial','Partial (some errors)'),('success','Successful runs'),('start','Run started')] %}
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" name="webhook_events" value="{{ ev }}"
+                     {% if ev in job_webhook_events %}checked{% endif %}
+                     class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-sky-500 focus:ring-sky-500 focus:ring-offset-gray-900"/>
+              <span class="text-sm text-gray-300">{{ label }}</span>
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="flex flex-wrap items-center gap-3">
+          <button type="button" id="testJobWebhookBtn" onclick="testJobWebhook()"
+                  class="text-xs px-3 py-2 bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 rounded-lg border border-sky-500/20">
+            Send test notification
+          </button>
+          <span id="testJobWebhookResult" class="text-xs" role="status" aria-live="polite"></span>
+        </div>
+      </div>
+    </div>
+
     <!-- Submit -->
     <div class="flex flex-col sm:flex-row gap-3">
       <button type="submit"
@@ -457,6 +511,47 @@
 
   function selectSourceAlbum(sel) {
     if (sel.value) document.getElementById('source_album_name').value = sel.value;
+  }
+
+  // ── Per-job notifications ────────────────────────────────────────────────────
+  function toggleNotifyCustom() {
+    const mode = document.getElementById('notify_override').value;
+    document.getElementById('notifyCustomFields').classList.toggle('hidden', mode !== 'custom');
+  }
+  toggleNotifyCustom();
+
+  async function testJobWebhook() {
+    const url   = document.getElementById('webhook_url').value.trim();
+    const jobId = document.getElementById('job_id').value || null;
+    const btn   = document.getElementById('testJobWebhookBtn');
+    const out   = document.getElementById('testJobWebhookResult');
+    const orig  = btn.textContent;
+    btn.textContent = 'Sending…';
+    btn.disabled = true;
+    out.textContent = '';
+    try {
+      const body = { url };
+      if (!url && jobId) body.job_id = parseInt(jobId, 10);
+      const res = await fetch('/api/test-webhook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.success) {
+        out.className = 'text-xs text-green-400';
+        out.textContent = '✓ Test notification sent';
+      } else {
+        out.className = 'text-xs text-red-400';
+        out.textContent = '✗ ' + (data.error || 'Failed to send');
+      }
+    } catch (e) {
+      out.className = 'text-xs text-red-400';
+      out.textContent = '✗ ' + e.message;
+    } finally {
+      btn.textContent = orig;
+      btn.disabled = false;
+    }
   }
 
   // Rotate the arrow on <details> open/close
