@@ -46,7 +46,7 @@ from .sync import LOG_PATH, release_job, run_sync_job, try_acquire_job
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
 
-SECRET_KEY = os.getenv("SECRET_KEY", "change-me-to-something-random-and-long")
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me-to-a-unique-random-32-64-char-string")
 # App version. Overridable at build/run time (e.g. baked from a git tag) via
 # the APP_VERSION env var; falls back to this default otherwise.
 APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
@@ -177,35 +177,37 @@ def _decrypt_key(stored: str) -> str:
 async def startup():
     # Validate SECRET_KEY before anything else. It both signs session cookies
     # AND derives the Fernet key that encrypts stored API keys, so a
-    # default/weak value is not merely "not recommended" — with the public
-    # default an attacker can forge a valid admin session and decrypt every
-    # stored key. Refuse to start rather than run insecurely.
-    _default_key = "change-me-to-something-random-and-long"
-    if SECRET_KEY == _default_key:
+    # default/weak value is not merely "not recommended" — with a known value
+    # an attacker can forge a valid admin session and decrypt every stored key.
+    # Refuse to start rather than run insecurely.
+    _key = SECRET_KEY.strip()
+    # Every shipped placeholder (code default, Unraid template, docker-compose
+    # example) begins with "change-me", so one prefix check rejects them all.
+    if _key.lower().startswith("change-me"):
         raise RuntimeError(
-            "SECRET_KEY is unset or left at the default. It signs sessions and "
-            "encrypts stored API keys, so the shipped default is insecure. Set a "
-            "unique 32–64 character SECRET_KEY environment variable and restart. "
-            "Refusing to start."
+            "SECRET_KEY is unset or still a placeholder ('change-me…'). It signs "
+            "sessions and encrypts stored API keys, so a known/default value is "
+            "insecure. Set a unique 32–64 character SECRET_KEY environment "
+            "variable and restart. Refusing to start."
         )
-    if len(SECRET_KEY) < 16:
+    if len(_key) < 16:
         raise RuntimeError(
-            f"SECRET_KEY is only {len(SECRET_KEY)} characters; the minimum is 16 "
+            f"SECRET_KEY is only {len(_key)} characters; the minimum is 16 "
             "(32–64 recommended). Set a longer SECRET_KEY and restart. "
             "Refusing to start with a weak key."
         )
-    if len(SECRET_KEY) < 32:
+    if len(_key) < 32:
         logger.warning(
-            f"⚠️  SECRET_KEY is {len(SECRET_KEY)} characters. This meets the "
+            f"⚠️  SECRET_KEY is {len(_key)} characters. This meets the "
             "minimum but 32–64 characters is recommended."
         )
-    elif len(SECRET_KEY) > 128:
+    elif len(_key) > 128:
         logger.warning(
-            f"⚠️  SECRET_KEY is {len(SECRET_KEY)} characters. "
+            f"⚠️  SECRET_KEY is {len(_key)} characters. "
             "Values longer than 128 characters provide no additional security benefit."
         )
     else:
-        logger.info(f"SECRET_KEY: {len(SECRET_KEY)} characters ✓")
+        logger.info(f"SECRET_KEY: {len(_key)} characters ✓")
 
     init_db()
     init_scheduler()

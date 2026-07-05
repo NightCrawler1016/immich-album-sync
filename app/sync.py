@@ -11,7 +11,7 @@ from typing import Callable, Optional
 from .crypto import decrypt_secret
 from .immich_client import ImmichClient
 
-_SECRET_KEY = os.getenv("SECRET_KEY", "change-me-to-something-random-and-long")
+_SECRET_KEY = os.getenv("SECRET_KEY", "change-me-to-a-unique-random-32-64-char-string")
 
 logger = logging.getLogger(__name__)
 

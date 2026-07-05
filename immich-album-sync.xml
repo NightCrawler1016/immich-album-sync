@@ -82,13 +82,13 @@
   <Config
     Name="Secret Key"
     Target="SECRET_KEY"
-    Default="change-me-please-use-a-long-random-string-here"
+    Default="change-me-to-a-unique-random-32-64-char-string"
     Mode=""
-    Description="REQUIRED: Change to a unique random string used to sign session cookies and encrypt stored API keys. Using the default value is INSECURE. Key length: minimum 16 characters | recommended 32–64 characters | maximum 128 characters (longer values provide no extra security). Generate a strong key at: https://1password.com/password-generator/ — select 32–64 characters, all character types. WARNING: changing this key after initial setup will invalidate all stored API keys and log out all active sessions — you will need to re-enter API keys for every sync job."
+    Description="REQUIRED: Change to a unique random string used to sign session cookies and encrypt stored API keys. The container WILL NOT START while this is left at the default/placeholder value (any value starting with 'change-me') or shorter than 16 characters. Key length: minimum 16 characters | recommended 32–64 characters | maximum 128 characters (longer values provide no extra security). Generate a strong key at: https://1password.com/password-generator/ — select 32–64 characters, all character types. WARNING: changing this key after initial setup will invalidate all stored API keys and log out all active sessions — you will need to re-enter API keys for every sync job."
     Type="Variable"
     Display="always"
     Required="true"
-    Mask="true">change-me-please-use-a-long-random-string-here</Config>
+    Mask="true">change-me-to-a-unique-random-32-64-char-string</Config>
 
   <Config
     Name="Timezone"
