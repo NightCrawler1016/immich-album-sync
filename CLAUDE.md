@@ -232,8 +232,9 @@ Image: `ghcr.io/nightcrawler1016/immich-album-sync`.
 `SECRET_KEY` (required), `TZ`, `PUID`/`PGID` (default 99:100), `CLEANUP_CACHE`,
 `CACHE_PATH` (default `/app/appdata/cache`), `BATCH_SIZE_MB` (10240), `BATCH_FILE_COUNT`
 (0), `DB_PATH` (`/app/appdata/config.db`), `LOG_PATH` (`/app/appdata/logs/sync.log`),
-`APP_VERSION` (build-time), `DOWNLOAD_TIMEOUT_SECONDS` (300, read in `immich_client.py`
-but **not** currently documented in README/XML).
+`RUN_HISTORY_RETENTION_DAYS` (90; `0` = forever; in README + XML), `APP_VERSION`
+(build-time). Read in code but **not** documented in README/XML: `DOWNLOAD_TIMEOUT_SECONDS`
+(300, `immich_client.py`) and `WEBHOOK_TIMEOUT_SECONDS` (10, `notify.py`).
 
 ---
 
@@ -304,10 +305,12 @@ if you change the code, keep the claim honest:
 - `http://` server URLs accepted with no warning → API key sent cleartext. (TLS verify is
   correctly **on** for `https://` — don't add an insecure toggle.)
 - CI actions pinned by mutable tag, not commit SHA.
-- `sync_runs` table and `sync.log` both grow unbounded (no retention/rotation). The
-  run-history queries are now indexed (`ix_sync_runs_started_at`, `ix_sync_runs_job_started`)
-  so reads stay fast, but nothing prunes old rows — a `*/5` job writes ~8.6k rows/month.
-  A retention prune (keep N days / N per job) is still a good follow-up.
+- `sync_runs` now has retention: `scheduler.prune_run_history()` deletes runs older than
+  `RUN_HISTORY_RETENTION_DAYS` (default 90; `0` = keep forever), always keeping the last
+  `_HISTORY_PER_JOB_FLOOR` (10) per job. Runs once on startup and daily at 03:30 UTC (an
+  APScheduler job id `maintenance_prune_history`). Reads stay fast via
+  `ix_sync_runs_started_at` / `ix_sync_runs_job_started`. **`sync.log` still grows
+  unbounded** (no rotation) — that's the remaining follow-up here.
 - Same-`originalFileName` assets collide in cache (one silently skipped) — namespace the
   cache filename with the asset id.
 - `decrypt_secret` swallows all exceptions and returns ciphertext as if plaintext; invalid

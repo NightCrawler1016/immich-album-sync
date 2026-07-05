@@ -1,5 +1,6 @@
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -10,6 +11,67 @@ logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone="UTC")
 
+# Always keep at least this many most-recent runs per job, even if older than
+# the retention window — so a paused/infrequent job never loses all its history.
+_HISTORY_PER_JOB_FLOOR = 10
+
+
+def _retention_days() -> int:
+    """Run-history retention in days. Default 90; 0 (or invalid) = keep forever."""
+    try:
+        return int(os.getenv("RUN_HISTORY_RETENTION_DAYS", "90"))
+    except (TypeError, ValueError):
+        return 90
+
+
+def prune_run_history() -> None:
+    """Delete SyncRun rows older than the retention window.
+
+    Keeps the most-recent ``_HISTORY_PER_JOB_FLOOR`` runs of each job regardless
+    of age. No-op when retention is 0. Runs on startup and daily; a delivery
+    failure here must never affect syncs, so all errors are swallowed + logged.
+    """
+    days = _retention_days()
+    if days <= 0:
+        return
+
+    from .database import SessionLocal
+    from .models import SyncRun
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    db = SessionLocal()
+    try:
+        job_ids = [row[0] for row in db.query(SyncRun.job_id).distinct().all()]
+        total_deleted = 0
+        for jid in job_ids:
+            keep_ids = [
+                r[0]
+                for r in db.query(SyncRun.id)
+                .filter(SyncRun.job_id == jid)
+                .order_by(SyncRun.started_at.desc())
+                .limit(_HISTORY_PER_JOB_FLOOR)
+                .all()
+            ]
+            q = db.query(SyncRun).filter(
+                SyncRun.job_id == jid, SyncRun.started_at < cutoff
+            )
+            if keep_ids:
+                q = q.filter(~SyncRun.id.in_(keep_ids))
+            total_deleted += q.delete(synchronize_session=False)
+        db.commit()
+        if total_deleted:
+            logger.info(
+                f"Run-history prune: deleted {total_deleted} run(s) older than {days} days"
+            )
+    except Exception as exc:
+        logger.error(f"Run-history prune failed: {exc}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
 
 def init_scheduler():
     """Start the APScheduler instance and attach an event listener."""
@@ -17,6 +79,19 @@ def init_scheduler():
     if not scheduler.running:
         scheduler.start()
         logger.info("APScheduler started (UTC timezone)")
+
+    # Daily run-history cleanup (03:30 UTC). Registered even when retention is
+    # off — prune_run_history() no-ops in that case, and this way toggling the
+    # env var takes effect on next restart without extra wiring.
+    scheduler.add_job(
+        prune_run_history,
+        trigger=CronTrigger(hour=3, minute=30, timezone="UTC"),
+        id="maintenance_prune_history",
+        name="Prune run history",
+        replace_existing=True,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
 
 
 def _on_job_event(event):

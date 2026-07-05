@@ -193,6 +193,7 @@ The downloadable support bundle never contains API keys, and server hostnames/IP
 | `BATCH_FILE_COUNT` | No | `0` | Max files per batch (0 = unlimited, size limit still applies) |
 | `DB_PATH` | No | `/app/appdata/config.db` | SQLite database path |
 | `LOG_PATH` | No | `/app/appdata/logs/sync.log` | Sync log file path |
+| `RUN_HISTORY_RETENTION_DAYS` | No | `90` | Days of run history to keep; older runs are pruned daily (the last 10 runs per job are always kept). `0` = keep forever |
 
 ---
 
