@@ -37,7 +37,7 @@ from .scheduler import (
     remove_job,
     schedule_job,
 )
-from .sync import LOG_PATH, run_sync_job
+from .sync import LOG_PATH, release_job, run_sync_job, try_acquire_job
 
 # --------------------------------------------------------------------------- #
 # App setup
@@ -46,24 +46,69 @@ from .sync import LOG_PATH, run_sync_job
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
 
-SECRET_KEY = os.getenv("SECRET_KEY", "change-me-to-something-random-and-long")
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me-to-a-unique-random-32-64-char-string")
 # App version. Overridable at build/run time (e.g. baked from a git tag) via
 # the APP_VERSION env var; falls back to this default otherwise.
 APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 
-app = FastAPI(title="Immich Album Sync", docs_url=None, redoc_url=None)
+# --------------------------------------------------------------------------- #
+# Global auth gate
+#
+# A single app-wide dependency enforces, for every route except the public set:
+#   1. an authenticated session, and
+#   2. that the forced first-login password change has been completed.
+#
+# Enforcing this in ONE place (rather than per-route) is deliberate: the
+# forced-change gate used to live only on the GET page handlers, so every POST
+# and /api/* route silently skipped it — a fresh admin/admin session could
+# create jobs or hit /api/test-connection without ever setting a password.
+# Applying the check app-wide means no new route can forget it.
+# --------------------------------------------------------------------------- #
+_PUBLIC_PATHS = {"/health", "/login", "/logout", "/change-password"}
+
+
+def _path_wants_json(path: str) -> bool:
+    """AJAX/JSON endpoints get a status code; page routes get a redirect."""
+    return (
+        path.startswith("/api/")
+        or path == "/logs/stream"
+        or path.endswith("/toggle")
+        or path.endswith("/run")
+    )
+
+
+def _auth_gate(request: Request):
+    path = request.url.path
+    if path in _PUBLIC_PATHS or path.startswith("/static"):
+        return
+    session = request.session
+    if not session.get("user"):
+        if _path_wants_json(path):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        raise HTTPException(status_code=302, headers={"Location": "/login"})
+    if session.get("must_change_password"):
+        if _path_wants_json(path):
+            raise HTTPException(status_code=403, detail="Password change required")
+        raise HTTPException(status_code=302, headers={"Location": "/change-password"})
+
+
+app = FastAPI(
+    title="Immich Album Sync",
+    docs_url=None,
+    redoc_url=None,
+    dependencies=[Depends(_auth_gate)],
+)
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=86400)  # 24 h
 
 # --------------------------------------------------------------------------- #
 # CSRF protection
 #
 # State-changing requests must originate from this app's own pages. We compare
-# the browser-set Origin (falling back to Referer) host against the Host header
-# and reject cross-site requests. Modern browsers always send Origin on POST,
-# so legitimate same-origin form posts and fetch() calls pass; a malicious
-# third-party page cannot forge a matching Origin. This complements the
-# SameSite=Lax session cookie set above (which already blocks cross-site
-# cookie-bearing POSTs) without needing a token in every form.
+# the browser-set Origin (falling back to Referer) host against the Host header.
+# Modern browsers always send Origin on POST/fetch, so legitimate same-origin
+# requests carry a matching value; we therefore fail CLOSED — a request with no
+# usable Origin/Referer on an unsafe method is rejected, not waved through.
+# This backs up the SameSite=Lax session cookie without needing a per-form token.
 # --------------------------------------------------------------------------- #
 _CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 
@@ -73,15 +118,14 @@ async def csrf_protect(request: Request, call_next):
     if request.method not in _CSRF_SAFE_METHODS:
         host = request.headers.get("host", "")
         source = request.headers.get("origin") or request.headers.get("referer")
-        if source:
-            netloc = urlparse(source).netloc
-            # Block only on a clear cross-origin mismatch. When neither header
-            # is present (rare for browsers) the SameSite cookie is the backstop.
-            if netloc and netloc != host:
-                return JSONResponse(
-                    {"error": "CSRF validation failed — request origin mismatch."},
-                    status_code=403,
-                )
+        source_netloc = urlparse(source).netloc if source else ""
+        # Fail closed: require a same-host Origin/Referer. Missing header,
+        # missing Host, or a cross-origin mismatch all reject.
+        if not host or source_netloc != host:
+            return JSONResponse(
+                {"error": "CSRF validation failed — request origin missing or mismatched."},
+                status_code=403,
+            )
     return await call_next(request)
 
 # Templates directory is relative to the Python package root
@@ -131,25 +175,39 @@ def _decrypt_key(stored: str) -> str:
 
 @app.on_event("startup")
 async def startup():
-    # Validate SECRET_KEY before anything else
-    _default_key = "change-me-to-something-random-and-long"
-    if SECRET_KEY == _default_key:
-        logger.warning(
-            "⚠️  SECRET_KEY is the default value — this is INSECURE. "
-            "Set a unique key in your environment variables."
+    # Validate SECRET_KEY before anything else. It both signs session cookies
+    # AND derives the Fernet key that encrypts stored API keys, so a
+    # default/weak value is not merely "not recommended" — with a known value
+    # an attacker can forge a valid admin session and decrypt every stored key.
+    # Refuse to start rather than run insecurely.
+    _key = SECRET_KEY.strip()
+    # Every shipped placeholder (code default, Unraid template, docker-compose
+    # example) begins with "change-me", so one prefix check rejects them all.
+    if _key.lower().startswith("change-me"):
+        raise RuntimeError(
+            "SECRET_KEY is unset or still a placeholder ('change-me…'). It signs "
+            "sessions and encrypts stored API keys, so a known/default value is "
+            "insecure. Set a unique 32–64 character SECRET_KEY environment "
+            "variable and restart. Refusing to start."
         )
-    elif len(SECRET_KEY) < 16:
-        logger.warning(
-            f"⚠️  SECRET_KEY is only {len(SECRET_KEY)} characters. "
-            "Minimum recommended length is 32 characters."
+    if len(_key) < 16:
+        raise RuntimeError(
+            f"SECRET_KEY is only {len(_key)} characters; the minimum is 16 "
+            "(32–64 recommended). Set a longer SECRET_KEY and restart. "
+            "Refusing to start with a weak key."
         )
-    elif len(SECRET_KEY) > 128:
+    if len(_key) < 32:
         logger.warning(
-            f"⚠️  SECRET_KEY is {len(SECRET_KEY)} characters. "
+            f"⚠️  SECRET_KEY is {len(_key)} characters. This meets the "
+            "minimum but 32–64 characters is recommended."
+        )
+    elif len(_key) > 128:
+        logger.warning(
+            f"⚠️  SECRET_KEY is {len(_key)} characters. "
             "Values longer than 128 characters provide no additional security benefit."
         )
     else:
-        logger.info(f"SECRET_KEY: {len(SECRET_KEY)} characters ✓")
+        logger.info(f"SECRET_KEY: {len(_key)} characters ✓")
 
     init_db()
     init_scheduler()
@@ -159,6 +217,18 @@ async def startup():
 
     db = SessionLocal()
     try:
+        # Reconcile runs left mid-flight by a previous process. A row can only be
+        # "running" if the process that owned it died (restart/crash/OOM) — mark
+        # them failed so the UI/history are accurate and the per-job run guard
+        # starts from a clean slate.
+        stale = db.query(SyncRun).filter(SyncRun.status == "running").all()
+        for r in stale:
+            r.status = "failed"
+            r.finished_at = datetime.utcnow()
+            r.error_message = "Interrupted by container restart"
+        if stale:
+            logger.info(f"Startup: marked {len(stale)} interrupted run(s) as failed")
+
         jobs = db.query(SyncJob).filter(SyncJob.enabled == True).all()  # noqa: E712
         for job in jobs:
             try:
@@ -641,6 +711,13 @@ async def job_run_now(request: Request, job_id: int, db: Session = Depends(get_d
     if not job:
         return JSONResponse({"error": "Job not found"}, status_code=404)
 
+    # Refuse to start a second concurrent run of this job (UI double-click, or a
+    # click racing a scheduled fire). Released in _run_background's finally.
+    if not try_acquire_job(job_id):
+        return JSONResponse(
+            {"error": "A sync for this job is already running."}, status_code=409
+        )
+
     # Create run record immediately so the UI can follow it
     run = SyncRun(job_id=job_id, started_at=datetime.utcnow(), status="running")
     db.add(run)
@@ -689,6 +766,7 @@ async def _run_background(job_id: int, run_id: int):
         except Exception:
             pass
     finally:
+        release_job(job_id)
         db.close()
 
 

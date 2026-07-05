@@ -10,8 +10,9 @@ services:
     volumes:
       - /mnt/user/appdata/immich-album-sync:/app/appdata
     environment:
-      # REQUIRED: Change this to a long random string for security
-      - SECRET_KEY=change-me-to-a-random-secret-key-at-least-32-chars
+      # REQUIRED: change this to a unique 32–64 char random string.
+      # The container REFUSES TO START while this is left at the placeholder.
+      - SECRET_KEY=change-me-to-a-unique-random-32-64-char-string
       # Optional: Set your timezone
       - TZ=America/New_York
       # Optional: UID/GID the app runs as (no longer root). 99:100 = Unraid

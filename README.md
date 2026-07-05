@@ -152,6 +152,8 @@ All Immich API keys entered in sync job forms are encrypted before being stored 
 | **Recommended length** | **32–64 characters** |
 | Maximum length | 128 characters (longer provides no additional benefit) |
 
+> **The container refuses to start** if `SECRET_KEY` is unset, left at a placeholder value (anything beginning with `change-me`), or shorter than 16 characters. This is deliberate: the key signs session cookies **and** encrypts stored API keys, so a known/default value would let anyone forge an admin session and decrypt your keys. Set a real key before starting.
+
 Generate a strong key: [1Password Generator](https://1password.com/password-generator/) — select 32–64 characters with all character types.
 
 > **Important:** Changing `SECRET_KEY` after the initial setup will **invalidate all stored API keys** (they were encrypted with the old key) and log out all active sessions. You will need to re-enter API keys for every sync job.
@@ -179,7 +181,7 @@ The downloadable support bundle never contains API keys, and server hostnames/IP
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `SECRET_KEY` | ✅ Yes | `change-me` | 32–64 char random string for session signing and API key encryption |
+| `SECRET_KEY` | ✅ Yes | _none — must set_ | 32–64 char random string for session signing and API key encryption. Container refuses to start without a real value. |
 | `TZ` | No | `UTC` | Container timezone (e.g. `America/New_York`) |
 | `PUID` | No | `99` | User ID the app runs as (non-root). `99` = Unraid `nobody` |
 | `PGID` | No | `100` | Group ID the app runs as. `100` = Unraid `users` |
@@ -380,7 +382,7 @@ In the **Live Logs** page, click **Download Support Bundle** to get a ZIP contai
 | Redirected to "Set Your Password" on login | First-login prompt (by design) | Set a new password — you cannot skip this step |
 | "Invalid username or password" | Wrong credentials | Default is `admin` / `admin`; check Settings if you changed it |
 | API key test fails | Insufficient permissions | Use Immich's API key settings to grant required roles (see table above) |
-| `SECRET_KEY` warning in logs | Using default or short key | Set a 32–64 character unique key in environment variables |
+| Container won't start / exits immediately, log says "Refusing to start" | `SECRET_KEY` is unset, a `change-me…` placeholder, or under 16 chars | Set a unique 32–64 character `SECRET_KEY` and restart |
 | Sync runs but 0 uploads | Duplicates already on dest | Normal — `immich-go` skips files already present |
 | Album not visible after sync | Immich UI cache | Refresh your Immich browser tab or wait a moment |
 | Cache fills up during large sync | Batch size too large for disk | Lower `BATCH_SIZE_MB` (e.g. `2048` for 2 GB batches) or route cache to a larger disk |
