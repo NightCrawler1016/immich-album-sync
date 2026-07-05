@@ -35,6 +35,31 @@ def get_db():
         db.close()
 
 
+def _migrate_schema():
+    """Apply lightweight in-place schema migrations for columns added after the
+    initial release.
+
+    SQLite's ``create_all`` only creates missing *tables*, never missing
+    *columns*, so an existing database from an older version keeps its old
+    ``sync_jobs`` shape. Each ADD COLUMN below is guarded by a ``table_info``
+    check, so this is idempotent and safe to run on every startup.
+    """
+    # column name -> SQLite column definition
+    new_columns = {
+        "notify_override": "VARCHAR(20) DEFAULT 'inherit'",
+        "webhook_url": "VARCHAR(1000)",
+        "webhook_events": "VARCHAR(100)",
+    }
+    with engine.begin() as conn:
+        existing = {
+            row[1] for row in conn.exec_driver_sql("PRAGMA table_info(sync_jobs)")
+        }
+        for col, ddl in new_columns.items():
+            if col not in existing:
+                conn.exec_driver_sql(f"ALTER TABLE sync_jobs ADD COLUMN {col} {ddl}")
+                logger.info(f"Schema migration: added column sync_jobs.{col}")
+
+
 def init_db():
     """Create all tables and seed default admin credentials."""
     # Ensure the appdata directory exists before SQLite tries to create the file.
@@ -47,6 +72,7 @@ def init_db():
     from . import models  # noqa: F401 — ensures models are registered
 
     Base.metadata.create_all(bind=engine)
+    _migrate_schema()
     logger.info(f"Database initialized at {DB_PATH}")
 
     db = SessionLocal()

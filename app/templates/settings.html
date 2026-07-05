@@ -68,6 +68,72 @@
     </form>
   </div>
 
+  <!-- Notifications -->
+  <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+    <h2 class="text-sm font-semibold text-gray-200 mb-1">Notifications</h2>
+    <p class="text-xs text-gray-500 mb-4">
+      Send a webhook when a sync runs. Works with any endpoint that accepts a JSON POST;
+      Discord and Slack incoming-webhook URLs are auto-formatted. Individual jobs can
+      override or disable this on their edit page.
+    </p>
+    <form method="post" action="/settings/webhook" class="space-y-4">
+
+      <label class="flex items-start gap-3 cursor-pointer group">
+        <div class="pt-0.5">
+          <input type="checkbox" name="webhook_enabled" value="on" id="webhook_enabled"
+                 {% if webhook_enabled %}checked{% endif %}
+                 class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-sky-500 focus:ring-sky-500 focus:ring-offset-gray-900"/>
+        </div>
+        <div>
+          <p class="text-sm font-medium text-gray-200 group-hover:text-white">Enable notifications</p>
+          <p class="text-xs text-gray-500">Global default for all jobs that don't override it.</p>
+        </div>
+      </label>
+
+      <div>
+        <label for="webhook_url" class="block text-sm font-medium text-gray-300 mb-1.5">
+          Webhook URL
+          {% if webhook_configured %}
+          <span class="ml-2 text-xs text-green-500 font-normal">● Saved securely</span>
+          {% endif %}
+        </label>
+        {# SECURITY: never render the stored URL — blank on submit keeps the existing one. #}
+        <input id="webhook_url" name="webhook_url" type="password"
+               value=""
+               placeholder="{% if webhook_configured %}Leave blank to keep current URL{% else %}https://discord.com/api/webhooks/…{% endif %}"
+               autocomplete="new-password"
+               class="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"/>
+        <p class="text-xs text-gray-500 mt-1">Stored encrypted at rest. Never rendered back into the page.</p>
+      </div>
+
+      <div>
+        <p class="block text-sm font-medium text-gray-300 mb-2">Notify on</p>
+        <div class="grid grid-cols-2 gap-2">
+          {% for ev, label in [('failed', 'Failed runs'), ('partial', 'Partial (some errors)'), ('success', 'Successful runs'), ('start', 'Run started')] %}
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" name="webhook_events" value="{{ ev }}"
+                   {% if ev in webhook_events %}checked{% endif %}
+                   class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-sky-500 focus:ring-sky-500 focus:ring-offset-gray-900"/>
+            <span class="text-sm text-gray-300">{{ label }}</span>
+          </label>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-3 pt-1">
+        <button type="submit"
+                class="px-5 py-2 bg-sky-500 hover:bg-sky-400 text-white font-medium rounded-lg text-sm active:scale-95">
+          Save Notifications
+        </button>
+        <button type="button" id="testWebhookBtn" onclick="testWebhook()"
+                class="text-xs px-3 py-2 bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 rounded-lg border border-sky-500/20">
+          Send test notification
+        </button>
+        <span id="testWebhookResult" class="text-xs" role="status" aria-live="polite"></span>
+      </div>
+    </form>
+  </div>
+
   <!-- About / Version -->
   <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
     <h2 class="text-sm font-semibold text-gray-200 mb-4">About</h2>
@@ -150,4 +216,39 @@
   </div>
 
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  async function testWebhook() {
+    const url = document.getElementById('webhook_url').value.trim();
+    const btn = document.getElementById('testWebhookBtn');
+    const out = document.getElementById('testWebhookResult');
+    const orig = btn.textContent;
+    btn.textContent = 'Sending…';
+    btn.disabled = true;
+    out.textContent = '';
+    try {
+      const res = await fetch('/api/test-webhook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        out.className = 'text-xs text-green-400';
+        out.textContent = '✓ Test notification sent';
+      } else {
+        out.className = 'text-xs text-red-400';
+        out.textContent = '✗ ' + (data.error || 'Failed to send');
+      }
+    } catch (e) {
+      out.className = 'text-xs text-red-400';
+      out.textContent = '✗ ' + e.message;
+    } finally {
+      btn.textContent = orig;
+      btn.disabled = false;
+    }
+  }
+</script>
 {% endblock %}

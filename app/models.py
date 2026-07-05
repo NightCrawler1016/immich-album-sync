@@ -28,6 +28,14 @@ class SyncJob(Base):
     cleanup_cache = Column(Boolean, default=False) # Delete cache after upload
     enabled = Column(Boolean, default=True)
 
+    # Notifications — per-job override of the global webhook settings.
+    #   notify_override: "inherit" (use global) | "off" (never notify) | "custom"
+    #   webhook_url:     encrypted; used only when notify_override == "custom"
+    #   webhook_events:  CSV of start,success,partial,failed; used when "custom"
+    notify_override = Column(String(20), default="inherit")
+    webhook_url = Column(String(1000), nullable=True)
+    webhook_events = Column(String(100), nullable=True)
+
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

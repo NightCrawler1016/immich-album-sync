@@ -61,6 +61,7 @@ app/
   crypto.py        # Fernet encrypt/decrypt of secrets, key derived from SECRET_KEY.
   database.py      # SQLAlchemy engine/session, init_db() seeds default admin.
   models.py        # SyncJob, SyncRun, Settings (key/value) tables.
+  notify.py        # Webhook notifications: resolve config, build/format payload, send.
   scheduler.py     # APScheduler wrapper: schedule_job / remove_job / runner.
   templates/*.html # base, login, change_password, dashboard, jobs, job_form, logs, settings
   static/icon.png  # served unauthenticated at /static (login page needs it)
@@ -100,6 +101,8 @@ return `401` instead of redirecting.
 | `/settings` | GET | Settings page | login + gate |
 | `/settings/username` | POST | Change username | login |
 | `/settings/password` | POST | Change password (verifies current) | login |
+| `/settings/webhook` | POST | Save global webhook (blank URL = keep) | login |
+| `/api/test-webhook` | POST | Send a sample notification | login (401) |
 | `/api/test-connection` | POST | Probe an Immich server + check API-key scopes | login (401) |
 | `/api/jobs/{id}/status` | GET | Job status JSON | login (401) |
 
@@ -107,13 +110,23 @@ return `401` instead of redirecting.
 
 - `SyncJob` — name, `source_url`/`source_key`/`source_album_name`,
   `dest_url`/`dest_key`/`dest_album_name`, `schedule` (5-field cron), `delete_sync`,
-  `cleanup_cache`, `enabled`, timestamps. **`source_key`/`dest_key` are Fernet
+  `cleanup_cache`, `enabled`, timestamps, plus notification columns
+  `notify_override` (`inherit`|`off`|`custom`), `webhook_url` (Fernet ciphertext),
+  `webhook_events` (CSV). **`source_key`/`dest_key`/`webhook_url` are Fernet
   ciphertext**, not plaintext.
 - `SyncRun` — per-run counters (found/downloaded/uploaded/skipped/failed), `status`
   (`running|success|partial|failed`), `error_message`, timestamps. Cascade-deleted with
   the job.
 - `Settings` — key/value store. Holds `admin_username`, `admin_password_hash` (bcrypt),
-  `password_changed` (`"true"`/`"false"`).
+  `password_changed` (`"true"`/`"false"`), and the global webhook config
+  `webhook_enabled` / `webhook_url` (encrypted) / `webhook_events` (CSV).
+
+> **⚠️ Adding a column to an existing table needs a migration.** SQLite `create_all`
+> only creates missing *tables*, never missing *columns*, so a model edit alone leaves
+> older databases broken. `database.py::_migrate_schema()` runs `ALTER TABLE … ADD COLUMN`
+> (idempotent, guarded by `PRAGMA table_info`) after `create_all`. When you add a `SyncJob`
+> column, add it to `_migrate_schema`'s `new_columns` map too. The notify columns above
+> were the first users of this.
 
 ### Sync flow (`sync.py::run_sync_job`)
 
@@ -136,6 +149,26 @@ return `401` instead of redirecting.
 Two triggers reach `run_sync_job`: the APScheduler cron (`scheduler.py::
 _scheduled_sync_runner`) and the "Run now" button (`main.py::_run_background` via
 `asyncio.create_task`). See the concurrency gotcha below.
+
+### Notifications (`notify.py`)
+
+- Both run paths (`_run_background`, `_scheduled_sync_runner`) fire a `start` event when
+  the run begins and a final event mapped from status via `notify.STATUS_TO_EVENT`
+  (`success`/`partial`/`failed`).
+- `notify.notify(db, job, event, results=, run=)` is the entry point. It loads the
+  `webhook_*` Settings rows, calls `_resolve_target(global_settings, job)` to pick the
+  effective `(url, events)`, gates on `event in events`, then POSTs. **It never raises** —
+  a failure is a logged warning, so notifications can't break a sync.
+- Config resolution: `notify_override == "off"` → silent; `"custom"` → the job's own
+  (decrypted) `webhook_url` + events; `"inherit"` (default) → the global config, but only
+  if `webhook_enabled == "true"`. Empty url or empty events → no send.
+- `build_payload(url, …)` picks the shape by URL host: Discord (`discord.com`/
+  `discordapp.com`) → embeds; Slack (`hooks.slack.com`) → attachments; anything else →
+  generic JSON. **Payloads carry no secrets** — job name, album names, counts, status,
+  timestamps, and (failures only) the error string. Never the API keys or webhook URL.
+- `send_test(url)` powers the "Send test" buttons via `POST /api/test-webhook` (which
+  falls back to the stored per-job/global URL when the field is left blank).
+- `_SECRET_KEY` is read from env at import (same as `sync.py`) to decrypt stored URLs.
 
 ---
 

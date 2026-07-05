@@ -38,6 +38,7 @@ from .scheduler import (
     schedule_job,
 )
 from .sync import LOG_PATH, release_job, run_sync_job, try_acquire_job
+from . import notify
 
 # --------------------------------------------------------------------------- #
 # App setup
@@ -519,6 +520,8 @@ async def job_new_get(request: Request):
             "job": None,
             "has_source_key": False,
             "has_dest_key": False,
+            "has_job_webhook": False,
+            "job_webhook_events": [],
             "error": None,
         }
     )
@@ -538,6 +541,9 @@ async def job_new_post(
     delete_sync: Optional[str] = Form(None),
     cleanup_cache: Optional[str] = Form(None),
     enabled: Optional[str] = Form(None),
+    notify_override: str = Form("inherit"),
+    webhook_url: str = Form(""),
+    webhook_events: Optional[list] = Form(None),
     db: Session = Depends(get_db),
 ):
     if not _logged_in(request):
@@ -555,6 +561,9 @@ async def job_new_post(
         delete_sync=delete_sync == "on",
         cleanup_cache=cleanup_cache == "on",
         enabled=enabled == "on",
+        notify_override=(notify_override.strip() or "inherit"),
+        webhook_url=_encrypt_key(webhook_url.strip()) if webhook_url.strip() else None,
+        webhook_events=notify.events_to_csv(webhook_events or []),
     )
     db.add(job)
     db.commit()
@@ -592,6 +601,8 @@ async def job_edit_get(request: Request, job_id: int, db: Session = Depends(get_
             "job": job,
             "has_source_key": bool(job.source_key),
             "has_dest_key": bool(job.dest_key),
+            "has_job_webhook": bool(job.webhook_url),
+            "job_webhook_events": list(notify.parse_events(job.webhook_events)),
             "error": None,
         }
     )
@@ -612,6 +623,9 @@ async def job_edit_post(
     delete_sync: Optional[str] = Form(None),
     cleanup_cache: Optional[str] = Form(None),
     enabled: Optional[str] = Form(None),
+    notify_override: str = Form("inherit"),
+    webhook_url: str = Form(""),
+    webhook_events: Optional[list] = Form(None),
     db: Session = Depends(get_db),
 ):
     if not _logged_in(request):
@@ -635,6 +649,11 @@ async def job_edit_post(
     job.delete_sync = delete_sync == "on"
     job.cleanup_cache = cleanup_cache == "on"
     job.enabled = enabled == "on"
+    job.notify_override = notify_override.strip() or "inherit"
+    job.webhook_events = notify.events_to_csv(webhook_events or [])
+    # Blank webhook URL means "keep existing" (same convention as API keys).
+    if webhook_url.strip():
+        job.webhook_url = _encrypt_key(webhook_url.strip())
     job.updated_at = datetime.utcnow()
 
     db.commit()
@@ -734,10 +753,13 @@ async def _run_background(job_id: int, run_id: int):
     from .database import SessionLocal
 
     db = SessionLocal()
+    job = None
     try:
         job = db.query(SyncJob).filter(SyncJob.id == job_id).first()
         if not job:
             return
+
+        await notify.notify(db, job, "start", run=None)
 
         results = await run_sync_job(job)
 
@@ -754,6 +776,9 @@ async def _run_background(job_id: int, run_id: int):
 
         job.last_run_at = datetime.utcnow()
         db.commit()
+
+        event = notify.STATUS_TO_EVENT.get(results.get("status", "success"), "success")
+        await notify.notify(db, job, event, results=results, run=run)
     except Exception as exc:
         logger.error(f"Background run error (job={job_id}): {exc}")
         try:
@@ -763,6 +788,12 @@ async def _run_background(job_id: int, run_id: int):
                 run.finished_at = datetime.utcnow()
                 run.error_message = str(exc)
                 db.commit()
+            if job:
+                await notify.notify(
+                    db, job, "failed",
+                    results={"status": "failed", "error_message": str(exc)},
+                    run=run,
+                )
         except Exception:
             pass
     finally:
@@ -962,10 +993,85 @@ async def settings_get(request: Request, db: Session = Depends(get_db)):
         {
             "request": request,
             "settings": settings,
+            "webhook_enabled": (settings.get("webhook_enabled") or "").lower() == "true",
+            "webhook_configured": bool(settings.get("webhook_url")),
+            "webhook_events": list(notify.parse_events(settings.get("webhook_events"))),
             "success": request.query_params.get("success"),
             "error": request.query_params.get("error"),
         },
     )
+
+
+@app.post("/settings/webhook")
+async def settings_webhook(
+    request: Request,
+    webhook_enabled: Optional[str] = Form(None),
+    webhook_url: str = Form(""),
+    webhook_events: Optional[list] = Form(None),
+    db: Session = Depends(get_db),
+):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=302)
+    url = webhook_url.strip()
+    if url and not notify.is_valid_webhook_url(url):
+        return RedirectResponse(
+            "/settings?error=Webhook+URL+must+be+an+http(s)+address", status_code=302
+        )
+    _upsert_setting(db, "webhook_enabled", "true" if webhook_enabled == "on" else "false")
+    _upsert_setting(db, "webhook_events", notify.events_to_csv(webhook_events or []))
+    # Blank URL means "keep existing" (same convention as API keys) — only
+    # replace when a new value is submitted. Encrypted at rest.
+    if url:
+        _upsert_setting(db, "webhook_url", _encrypt_key(url))
+    return RedirectResponse("/settings?success=Notification+settings+saved", status_code=302)
+
+
+@app.post("/api/test-webhook")
+async def api_test_webhook(request: Request, db: Session = Depends(get_db)):
+    """Send a sample notification. Body: { url?, job_id? }.
+
+    When url is blank, fall back to the stored URL — the job's own when a
+    job_id is given and it uses a custom webhook, otherwise the global one —
+    so the "leave blank to keep current" fields can still be tested.
+    """
+    if not _logged_in(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    url = (body.get("url") or "").strip()
+    if not url:
+        job_id = body.get("job_id")
+        if job_id:
+            try:
+                job = db.query(SyncJob).filter(SyncJob.id == int(job_id)).first()
+                if job and job.webhook_url:
+                    url = _decrypt_key(job.webhook_url)
+            except Exception:
+                pass
+        if not url:
+            row = db.query(Settings).filter(Settings.key == "webhook_url").first()
+            if row and row.value:
+                url = _decrypt_key(row.value)
+    if not url:
+        return JSONResponse(
+            {"error": "Enter a webhook URL to test (or save one first)."}, status_code=400
+        )
+    if not notify.is_valid_webhook_url(url):
+        return JSONResponse(
+            {"error": "Webhook URL must be an http(s):// address."}, status_code=400
+        )
+
+    ok, detail = await notify.send_test(url)
+    if ok:
+        return JSONResponse({"success": True})
+    # detail is a sanitized error type (never the URL/token) — safe to surface.
+    msg = "Test send failed — check the URL is correct and reachable."
+    if detail:
+        msg += f" [{detail}]"
+    return JSONResponse({"success": False, "error": msg}, status_code=400)
 
 
 @app.post("/settings/username")
