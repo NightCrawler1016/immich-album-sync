@@ -55,13 +55,74 @@ class ImmichClient:
         return None
 
     async def get_album_assets(self, album_id: str) -> list:
-        """Return all assets belonging to an album."""
+        """Return all assets belonging to an album.
+
+        Immich <= v2 embeds the full asset array in the album-detail response.
+        Immich v3.0.0 removed that property (see immich.app/blog/v3-migration);
+        the replacement is the paginated search endpoint filtered by album id.
+        Try the embedded array first (single request, correct on old servers)
+        and fall back to search when it is missing — or empty despite a
+        non-zero assetCount, which signals a server that no longer embeds
+        assets in album detail.
+        """
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.get(
                 f"{self.base_url}/api/albums/{album_id}", headers=self.headers
             )
             resp.raise_for_status()
-            return resp.json().get("assets", [])
+            detail = resp.json()
+
+        assets = detail.get("assets")
+        if assets:
+            return assets  # Immich <= v2 — embedded array present
+        if isinstance(assets, list) and not detail.get("assetCount"):
+            return []  # genuinely empty album on an old server
+        if "assets" not in detail and detail.get("assetCount") == 0:
+            return []  # Immich v3+ empty album — searching would be a no-op
+
+        # 'assets' absent (Immich v3+) with assets to fetch — or empty/missing
+        # in an unexpected combination; let the search endpoint decide.
+        return await self._search_album_assets(album_id)
+
+    async def _search_album_assets(self, album_id: str) -> list:
+        """List an album's assets via POST /api/search/metadata (Immich v3 path).
+
+        Paginated: up to 1000 assets per request; ``assets.nextPage`` is the
+        next page number as a string, null on the last page. The returned
+        asset objects carry the same fields the sync engine consumes from the
+        legacy album-detail array (id, originalFileName, checksum as base64
+        SHA-1, livePhotoVideoId). Requires the asset.read scope.
+        """
+        items: list = []
+        page = 1
+        _max_pages = 10_000  # 10M assets — guards against a non-advancing nextPage
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            while page <= _max_pages:
+                resp = await client.post(
+                    f"{self.base_url}/api/search/metadata",
+                    headers={**self.headers, "Content-Type": "application/json"},
+                    json={"albumIds": [album_id], "page": page, "size": 1000},
+                )
+                resp.raise_for_status()
+                assets = resp.json().get("assets", {})
+                items.extend(assets.get("items", []))
+                next_page = assets.get("nextPage")
+                if not next_page:
+                    break
+                # Server returns the next page number as a string (page + 1);
+                # require forward progress so a buggy value can't loop forever.
+                try:
+                    next_num = int(next_page)
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        "Unexpected pagination token from the Immich search API "
+                        f"(assets.nextPage={next_page!r}) — album listing aborted "
+                        "to avoid a partial sync"
+                    )
+                if next_num <= page:
+                    break
+                page = next_num
+        return items
 
     async def get_asset_info(self, asset_id: str) -> dict:
         """Return full metadata for a single asset."""
@@ -165,7 +226,10 @@ class ImmichClient:
             # Walk albums until we find one containing at least one asset.
             # The album-detail endpoint is covered by album.read, so this does
             # not prove asset.read / asset.download on its own.
+            # Immich v3 no longer embeds 'assets' in album detail, so fall back
+            # to a size-1 search/metadata query (asset.read scope) there.
             sample_asset_id: str | None = None
+            search_denied = False  # v3 sample search 403'd → key lacks asset.read
             if albums:
                 for alb in albums:
                     try:
@@ -176,10 +240,31 @@ class ImmichClient:
                         if resp.status_code == 403:
                             break  # album.read denied — already reflected above
                         resp.raise_for_status()
-                        alb_assets = resp.json().get("assets", [])
+                        detail = resp.json()
+                        alb_assets = detail.get("assets") or []
                         if alb_assets:
                             sample_asset_id = alb_assets[0]["id"]
                             break
+                        if "assets" not in detail and detail.get("assetCount"):
+                            # Immich v3+: ask the search endpoint for one asset
+                            s = await client.post(
+                                f"{self.base_url}/api/search/metadata",
+                                headers={**self.headers,
+                                         "Content-Type": "application/json"},
+                                json={"albumIds": [alb["id"]],
+                                      "page": 1, "size": 1},
+                            )
+                            if s.status_code == 403:
+                                # Scope denial is key-wide — no other album
+                                # will answer differently. This is a definitive
+                                # asset.read failure, reported below.
+                                search_denied = True
+                                break
+                            s.raise_for_status()
+                            hits = s.json().get("assets", {}).get("items", [])
+                            if hits:
+                                sample_asset_id = hits[0]["id"]
+                                break
                     except Exception:
                         continue
 
@@ -211,6 +296,17 @@ class ImmichClient:
                         "desc": "Read asset metadata (filenames, Live Photo pairing)",
                         "ok": False, "detail": str(exc),
                     })
+            elif search_denied:
+                # v3 server: album contents are listed via the search API, and
+                # this key was refused there — a definitive asset.read failure.
+                results.append({
+                    "name": "asset.read",
+                    "desc": "Read asset metadata (filenames, Live Photo pairing)",
+                    "ok": False,
+                    "detail": "Permission denied — enable asset.read scope on this "
+                              "API key (this server lists album contents via the "
+                              "search API, which requires asset.read)",
+                })
             else:
                 results.append({
                     "name": "asset.read",
@@ -259,7 +355,9 @@ class ImmichClient:
                         "name": "asset.download",
                         "desc": "Download original photo and video files",
                         "ok": None,
-                        "detail": "Cannot verify — no assets in any album to test against",
+                        "detail": ("Cannot verify until asset.read is granted"
+                                   if search_denied else
+                                   "Cannot verify — no assets in any album to test against"),
                     })
 
             if role == "dest":

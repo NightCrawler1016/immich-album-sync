@@ -367,10 +367,14 @@ With the default 10 GB limit, syncs under 10 GB behave exactly as before (single
 2. Finds the configured source album by name and lists all assets (including Live Photo `.MOV` companions)
 3. **Checksum pre-check** — asks **Immich B** which of those assets it already has (by SHA-1). Assets already present are added straight to the destination album via the API, with **no download or upload**; only genuinely-new assets continue to the next step
 4. Downloads the new originals to the local cache in rolling batches — once a batch reaches `BATCH_SIZE_MB` (default 10 GB) or `BATCH_FILE_COUNT`, it is immediately uploaded and cleared before the next batch begins
-5. Uploads each batch to **Immich B** using [`immich-go`](https://github.com/simulot/immich-go) (v0.31.0), which performs a second layer of duplicate detection on the destination
+5. Uploads each batch to **Immich B** using [`immich-go`](https://github.com/simulot/immich-go) (v0.32.0), which performs a second layer of duplicate detection on the destination
 6. Logs all activity to `/app/appdata/logs/sync.log`, viewable live in the browser
 
 Re-syncing an unchanged album is nearly free: the checksum pre-check skips every already-synced asset before any bytes are transferred, so there is no wasted bandwidth or disk. The pre-check is best-effort — if it ever fails, the engine falls back to downloading everything and lets `immich-go` de-dupe on upload, so no asset is ever missed. Files already present in the cache are also skipped on re-download.
+
+### Immich Server Compatibility
+
+Works with **Immich v1/v2 and v3**. Immich v3.0.0 removed the embedded `assets` array from album responses ([v3 migration guide](https://immich.app/blog/v3-migration)); the sync engine detects this automatically and lists album contents via the paginated search API instead, with no configuration needed. Uploads use immich-go v0.32.0, which auto-detects the server version.
 
 ---
 
@@ -429,6 +433,7 @@ In the **Live Logs** page, click **Download Support Bundle** to get a ZIP contai
 | API key test fails | Insufficient permissions | Use Immich's API key settings to grant required roles (see table above) |
 | Container won't start / exits immediately, log says "Refusing to start" | `SECRET_KEY` is unset, a `change-me…` placeholder, or under 16 chars | Set a unique 32–64 character `SECRET_KEY` and restart |
 | Sync runs but 0 uploads | Duplicates already on dest | Normal — `immich-go` skips files already present |
+| `Assets : 0 in album` after upgrading Immich to v3 | Older image predates the Immich v3 API changes | Update to the latest image — album listing and uploads are v3-compatible now |
 | Album not visible after sync | Immich UI cache | Refresh your Immich browser tab or wait a moment |
 | Cache fills up during large sync | Batch size too large for disk | Lower `BATCH_SIZE_MB` (e.g. `2048` for 2 GB batches) or route cache to a larger disk |
 | Sync stops mid-way with "partial" status | Upload error during a batch | Cached files are kept — fix the error and re-run; completed batches won't re-upload |
@@ -438,7 +443,7 @@ In the **Live Logs** page, click **Download Support Bundle** to get a ZIP contai
 
 ## Notes on immich-go
 
-This container pins [`immich-go`](https://github.com/simulot/immich-go) to **v0.31.0** for stability. The upload command used internally:
+This container pins [`immich-go`](https://github.com/simulot/immich-go) to **v0.32.0** for stability. The upload command used internally:
 
 ```bash
 immich-go upload from-folder \
@@ -448,7 +453,7 @@ immich-go upload from-folder \
   --recursive /path/to/cache
 ```
 
-> Note: flags must appear **after** `from-folder` in v0.31.0. Earlier versions used different syntax.
+> Note: flags must appear **after** `from-folder` (v0.31.0+ syntax). v0.32.0 adds **Immich v3 server compatibility** — it auto-detects the server version and remains backward compatible with Immich v2. (v0.31.0 uploads fail against Immich v3 with HTTP 400 — [immich-go#1372](https://github.com/simulot/immich-go/issues/1372).)
 
 ---
 
