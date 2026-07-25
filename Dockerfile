@@ -16,8 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Use uname -m to detect the real running architecture — reliable under
 # both native builds and QEMU cross-compilation (where ARG TARGETARCH
 # can silently stay at its default value instead of being overridden).
-# v0.31.0 uses: immich-go upload from-folder --into-album NAME --recursive DIR
-ENV IMMICH_GO_VERSION=v0.31.0
+# Syntax (unchanged since v0.31): immich-go upload from-folder --into-album NAME --recursive DIR
+# v0.32.0 adds Immich v3 server compatibility (auto-detects server version;
+# v0.31.0 uploads fail against Immich v3 with HTTP 400 — simulot/immich-go#1372)
+# while remaining backward compatible with Immich v2.
+ENV IMMICH_GO_VERSION=v0.32.0
 RUN set -ex && \
     ARCH=$(uname -m) && \
     case "$ARCH" in \

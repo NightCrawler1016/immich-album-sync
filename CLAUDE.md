@@ -3,8 +3,9 @@
 One-way album sync between two [Immich](https://immich.app) servers, with a web UI.
 Private/master Immich A → curated/family Immich B. Photos are pulled from A via the
 Immich REST API and pushed to B with the [`immich-go`](https://github.com/simulot/immich-go)
-CLI (pinned **v0.31.0**), which does the duplicate detection and album creation on the
-destination.
+CLI (pinned **v0.32.0** — adds Immich v3 server support, backward compatible with v2;
+v0.31.0 uploads 400 against v3), which does the duplicate detection and album creation
+on the destination.
 
 - **Public project.** Published on GitHub as
   [`NightCrawler1016/immich-album-sync`](https://github.com/NightCrawler1016/immich-album-sync)
@@ -134,7 +135,11 @@ return `401` instead of redirecting.
 1. Decrypt both API keys (`decrypt_secret`, falls back to treating value as legacy
    plaintext on any failure).
 2. Locate source album by name (case-insensitive), list assets, pair Live Photo `.MOV`
-   companions via `livePhotoVideoId`.
+   companions via `livePhotoVideoId`. Listing is version-adaptive: album-detail
+   `assets` array on Immich ≤ v2; Immich v3 removed it, so `get_album_assets` falls
+   back to paginated `POST /api/search/metadata` with `albumIds` (needs `asset.read`,
+   which source keys already have). `check_permissions` uses the same fallback to
+   find its sample asset.
 3. **Checksum pre-check** against the destination (`/api/assets/bulk-upload-check` by
    SHA-1): assets already on B are added straight to the album (no download/upload);
    only new assets are queued. Best-effort — on failure it downloads everything and lets
@@ -142,7 +147,8 @@ return `401` instead of redirecting.
 4. Download new originals into `${CACHE_PATH}/job_{id}/files` in **rolling batches**
    (`BATCH_SIZE_MB` / `BATCH_FILE_COUNT`); each full batch is uploaded then cleared.
 5. Upload each batch via `immich-go upload from-folder --server URL --api-key KEY
-   --into-album NAME --recursive DIR` (flags **must** come after `from-folder` in v0.31).
+   --into-album NAME --recursive DIR` (flags **must** come after `from-folder`;
+   syntax unchanged in v0.32).
 6. Cache clearing: intermediate batches always cleared; final batch cleared only if
    `cleanup_cache` and the run succeeded. Mid-batch upload error → stop early, keep cache
    for the next run (status `partial`).
