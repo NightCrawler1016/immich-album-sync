@@ -358,3 +358,20 @@ docker run -p 8080:8080 \
   the README claim in the same change.
 - `main.py` is large — read the section you need; it's organized with clear banner
   comments per area (auth, CSRF, jobs, logs, settings, api).
+
+## AI Architectural & Pragmatism Rules
+
+1. **YAGNI (You Aren't Gonna Need It):** Build ONLY the requested features. Do not add
+   unused abstraction layers, speculative hooks, unused helper parameters, or
+   future-proofing logic — unless omitting it would break upgrades or persisted data
+   (schema migrations, cache-busting and similar plumbing are load-bearing, not
+   speculative).
+2. **KISS (Keep It Simple):** Use native browser APIs before reaching for libraries.
+   Prefer flat, readable code with early returns over deeply nested logic.
+3. **DRY Pragmatism:** Abstract logic when exact repetition occurs, but avoid hasty
+   abstractions for mildly similar UI components.
+4. **Single Responsibility:** Keep rendering/presentation separate from data fetching,
+   complex state, and heavy calculations — following the separation pattern the codebase
+   already uses.
+5. **No Unused Code:** Do not output dead functions, unused variables, empty handlers,
+   or unreferenced imports.
