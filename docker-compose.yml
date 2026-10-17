@@ -19,6 +19,12 @@ services:
       - PGID=100
       # Optional: Set to "true" to delete cached files after successful upload
       - CLEANUP_CACHE=false
+      # Optional HTTPS (off by default — plain http:// is fine on a home LAN).
+      # Serve HTTPS directly on 8080 with your own PEM cert + key:
+      # - HTTPS_CERT_FILE=/app/appdata/certs/cert.pem
+      # - HTTPS_KEY_FILE=/app/appdata/certs/key.pem
+      # …or, when an HTTPS reverse proxy is in front, secure the login cookie:
+      # - SESSION_COOKIE_SECURE=true
     labels:
       - "net.unraid.docker.managed=dockerman"
       - "net.unraid.docker.webui=http://[IP]:[PORT:8080]"

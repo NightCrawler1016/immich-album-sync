@@ -12,20 +12,23 @@ import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import httpx
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
+    PlainTextResponse,
     RedirectResponse,
+    Response,
     StreamingResponse,
 )
 import bcrypt as _bcrypt
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
+from starlette.datastructures import UploadFile
 from starlette.middleware.sessions import SessionMiddleware
 
 from .crypto import (
@@ -46,7 +49,7 @@ from .scheduler import (
     schedule_job,
 )
 from .sync import CACHE_BASE, LOG_PATH, release_job, try_acquire_job
-from . import notify
+from . import backup, notify
 
 # --------------------------------------------------------------------------- #
 # App setup
@@ -91,7 +94,7 @@ def _get_setting(db: Session, key: str) -> Optional[str]:
     return row.value if row else None
 
 
-def _logged_in(request: Request) -> bool:
+def _logged_in(request: Request, db: Session) -> bool:
     """True if the session has a user AND was issued in the current session epoch.
 
     Session cookies are stateless and signed, so a copied cookie can't be
@@ -102,15 +105,19 @@ def _logged_in(request: Request) -> bool:
     session = request.session
     if not session.get("user"):
         return False
-    db = SessionLocal()
-    try:
-        epoch = _get_setting(db, "session_epoch") or "0"
-    finally:
-        db.close()
-    if session.get("epoch") != epoch:
+    if session.get("epoch") != (_get_setting(db, "session_epoch") or "0"):
         session.clear()
         return False
     return True
+
+
+def _password_change_pending(db: Session) -> bool:
+    """True until the default admin password is replaced (fresh installs seed "false").
+
+    Read from the DB on every request rather than cached in the session, so no
+    session can carry a stale flag past the forced change.
+    """
+    return _get_setting(db, "password_changed") == "false"
 
 
 def _bump_session_epoch(db: Session, request: Request) -> None:
@@ -128,12 +135,20 @@ def _auth_gate(request: Request):
     path = request.scope["path"]
     if path in _PUBLIC_PATHS or path.startswith("/static"):
         return
-    session = request.session
-    if not _logged_in(request):
+    # A short-lived session of its own: a get_db session stays checked out until
+    # the response finishes, so every open /logs/stream would pin a pool connection.
+    db = SessionLocal()
+    try:
+        logged_in = _logged_in(request, db)
+        change_pending = logged_in and _password_change_pending(db)
+    finally:
+        db.close()
+    if not logged_in:
         if _path_wants_json(path):
             raise HTTPException(status_code=401, detail="Unauthorized")
         raise HTTPException(status_code=302, headers={"Location": "/login"})
-    if session.get("must_change_password"):
+    # Fresh install: nothing but the forced password change until it's done.
+    if change_pending:
         if _path_wants_json(path):
             raise HTTPException(status_code=403, detail="Password change required")
         raise HTTPException(status_code=302, headers={"Location": "/change-password"})
@@ -145,7 +160,17 @@ app = FastAPI(
     redoc_url=None,
     dependencies=[Depends(_auth_gate)],
 )
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=86400)  # 24 h
+# Optional HTTPS (off by default — plain-HTTP LAN use must keep working). With
+# HTTPS_CERT_FILE + HTTPS_KEY_FILE the container serves TLS itself (wired in
+# entrypoint.sh); SESSION_COOKIE_SECURE=true is for TLS terminated by a reverse
+# proxy. Either way the session cookie is marked Secure, which browsers never
+# send over plain HTTP — so this must stay off for http:// access.
+NATIVE_HTTPS = bool(os.getenv("HTTPS_CERT_FILE") and os.getenv("HTTPS_KEY_FILE"))
+SESSION_COOKIE_SECURE = NATIVE_HTTPS or os.getenv("SESSION_COOKIE_SECURE", "").strip().lower() == "true"
+app.add_middleware(
+    SessionMiddleware, secret_key=SECRET_KEY, max_age=86400,  # 24 h
+    https_only=SESSION_COOKIE_SECURE,
+)
 
 # --------------------------------------------------------------------------- #
 # CSRF protection
@@ -182,6 +207,8 @@ async def csrf_protect(request: Request, call_next):
 
 
 _MAX_BODY_BYTES = 64 * 1024  # every legitimate request body here is a few KB
+_RESTORE_PATH = "/settings/restore"
+_RESTORE_MAX_BYTES = 2 * 1024 * 1024  # an uploaded backup file
 
 
 class _BodySizeLimit:
@@ -198,6 +225,18 @@ class _BodySizeLimit:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        restore = scope["path"] == _RESTORE_PATH
+        limit = _RESTORE_MAX_BYTES if restore else _MAX_BODY_BYTES
+        # Reject a declared oversize body up front (browsers always declare it):
+        # the error raised mid-stream below can't be caught by a route and ends
+        # as a 500, so it is only the backstop for chunked bodies.
+        declared = dict(scope["headers"]).get(b"content-length", b"")
+        if declared.isdigit() and int(declared) > limit:
+            response = (
+                _settings_redirect("error", "That file is too large to be a backup.") if restore
+                else PlainTextResponse("Request body too large", status_code=413)
+            )
+            return await response(scope, receive, send)
         received = 0
 
         async def limited_receive():
@@ -205,7 +244,7 @@ class _BodySizeLimit:
             message = await receive()
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
-                if received > _MAX_BODY_BYTES:
+                if received > limit:
                     raise HTTPException(status_code=413, detail="Request body too large")
             return message
 
@@ -297,6 +336,11 @@ async def startup():
         )
     else:
         logger.info(f"SECRET_KEY: {len(_key)} characters ✓")
+
+    if NATIVE_HTTPS:
+        logger.info("HTTPS: serving TLS directly (session cookie marked Secure)")
+    elif SESSION_COOKIE_SECURE:
+        logger.info("HTTPS: SESSION_COOKIE_SECURE=true — the UI must be reached over https://")
 
     init_db()
     init_scheduler()
@@ -441,8 +485,8 @@ async def health():
 # --------------------------------------------------------------------------- #
 
 @app.get("/login", response_class=HTMLResponse)
-async def login_get(request: Request):
-    if _logged_in(request):
+async def login_get(request: Request, db: Session = Depends(get_db)):
+    if _logged_in(request, db):
         return RedirectResponse("/", status_code=302)
     return templates.TemplateResponse("login.html", {"request": request, "error": None})
 
@@ -474,10 +518,7 @@ async def login_post(
         request.session.clear()
         request.session["user"] = username
         request.session["epoch"] = _get_setting(db, "session_epoch") or "0"
-        # Check if first-login password change is still required
-        pw_row = db.query(Settings).filter(Settings.key == "password_changed").first()
-        if pw_row and pw_row.value == "false":
-            request.session["must_change_password"] = True
+        if _password_change_pending(db):
             return RedirectResponse("/change-password", status_code=302)
         return RedirectResponse("/", status_code=302)
 
@@ -498,13 +539,13 @@ async def logout(request: Request):
 # --------------------------------------------------------------------------- #
 
 @app.get("/change-password", response_class=HTMLResponse)
-async def change_password_get(request: Request):
+async def change_password_get(request: Request, db: Session = Depends(get_db)):
     """Standalone page displayed when the default password has never been changed."""
-    if not _logged_in(request):
+    if not _logged_in(request, db):
         return RedirectResponse("/login", status_code=302)
     # Only during the forced first-login change — this form skips the current
     # password; normal changes go through /settings/password, which checks it.
-    if not request.session.get("must_change_password"):
+    if not _password_change_pending(db):
         return RedirectResponse("/settings", status_code=302)
     return templates.TemplateResponse(
         "change_password.html", {"request": request, "error": None}
@@ -518,9 +559,9 @@ async def change_password_post(
     confirm_password: str = Form(...),
     db: Session = Depends(get_db),
 ):
-    if not _logged_in(request):
+    if not _logged_in(request, db):
         return RedirectResponse("/login", status_code=302)
-    if not request.session.get("must_change_password"):
+    if not _password_change_pending(db):
         return RedirectResponse("/settings", status_code=302)
 
     error = None
@@ -539,7 +580,6 @@ async def change_password_post(
     _upsert_setting(db, "admin_password_hash", _hash_password(new_password))
     _upsert_setting(db, "password_changed", "true")
     _bump_session_epoch(db, request)
-    request.session.pop("must_change_password", None)
     logger.info("Admin password changed from default on first login")
     return RedirectResponse("/", status_code=302)
 
@@ -1168,8 +1208,6 @@ async def settings_get(request: Request, db: Session = Depends(get_db)):
             "webhook_enabled": (settings.get("webhook_enabled") or "").lower() == "true",
             "webhook_configured": bool(settings.get("webhook_url")),
             "webhook_events": list(notify.parse_events(settings.get("webhook_events"))),
-            "success": request.query_params.get("success"),
-            "error": request.query_params.get("error"),
         },
     )
 
@@ -1277,8 +1315,143 @@ async def settings_password(
     _upsert_setting(db, "admin_password_hash", _hash_password(new_password))
     _upsert_setting(db, "password_changed", "true")
     _bump_session_epoch(db, request)
-    request.session.pop("must_change_password", None)
     return RedirectResponse("/settings?success=Password+updated+successfully", status_code=302)
+
+
+# --------------------------------------------------------------------------- #
+# Settings — configuration backup / restore (file format: backup.py)
+# --------------------------------------------------------------------------- #
+
+def _settings_redirect(kind: str, message: str) -> RedirectResponse:
+    return RedirectResponse(f"/settings?{kind}={quote_plus(message)}", status_code=302)
+
+
+@app.post("/settings/backup")
+def settings_backup(
+    passphrase: str = Form(""),
+    confirm_passphrase: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Download every job plus the notification settings as one JSON file.
+
+    A plain def: the passphrase KDF is deliberately slow, so FastAPI runs this
+    in the threadpool instead of on the event loop.
+    """
+    if passphrase != confirm_passphrase:
+        return _settings_redirect("error", "Backup passphrases do not match.")
+    if passphrase and len(passphrase) < backup.MIN_PASSPHRASE:
+        return _settings_redirect(
+            "error", f"Backup passphrase must be at least {backup.MIN_PASSPHRASE} characters."
+        )
+    jobs = db.query(SyncJob).order_by(SyncJob.created_at).all()
+    settings = {s.key: s.value for s in db.query(Settings).all()}
+    data = backup.export_config(jobs, settings, SECRET_KEY, passphrase, APP_VERSION)
+    filename = f"immich-album-sync-backup-{datetime.utcnow():%Y%m%d-%H%M%S}.json"
+    return Response(
+        data,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post(_RESTORE_PATH)
+async def settings_restore(request: Request, db: Session = Depends(get_db)):
+    """Replace every job and the notification settings with a backup's contents.
+
+    The form is parsed here instead of through File()/Form() parameters:
+    FastAPI parses declared bodies before it runs dependencies, and this route
+    accepts a much larger body — so only requests that passed the auth gate
+    are parsed.
+    """
+    try:
+        async with request.form(max_files=1, max_fields=5) as form:
+            upload = form.get("backup_file")
+            passphrase = form.get("passphrase")
+            raw = await upload.read() if isinstance(upload, UploadFile) else b""
+    except HTTPException:  # Starlette's 400 for a malformed multipart body
+        return _settings_redirect("error", "The upload couldn't be read — try again.")
+    if not raw:
+        return _settings_redirect("error", "Choose a backup file to restore.")
+    try:
+        config = await asyncio.to_thread(
+            backup.import_config, raw, passphrase if isinstance(passphrase, str) else ""
+        )
+    except backup.BackupError as exc:
+        return _settings_redirect("error", str(exc))
+
+    # Validate everything before touching the database: all or nothing.
+    for j in config["jobs"]:
+        error = _job_input_error(j["schedule"], j["webhook_url"])
+        if error:
+            return _settings_redirect("error", f"Nothing was restored — job '{j['name']}': {error}")
+    notif = config["notifications"]
+    if notif["webhook_url"] and not notify.is_valid_webhook_url(notif["webhook_url"]):
+        return _settings_redirect("error", "Nothing was restored — the backup's webhook URL is invalid.")
+
+    old_jobs = db.query(SyncJob).all()
+    held = []
+    try:
+        # Hold every job's run reservation so no sync is mid-flight in a cache
+        # we're about to delete, and none can start until the swap is done.
+        for job in old_jobs:
+            if not try_acquire_job(job.id):
+                return _settings_redirect(
+                    "error", "A sync is running — restore once it finishes. Nothing was changed."
+                )
+            held.append(job.id)
+
+        for job in old_jobs:
+            db.delete(job)  # its run history goes with it (cascade)
+        new_jobs = []
+        for j in config["jobs"]:
+            j = dict(
+                j,
+                source_key=_encrypt_key(j["source_key"]),
+                dest_key=_encrypt_key(j["dest_key"]),
+                webhook_url=_encrypt_key(j["webhook_url"]) or None,
+                webhook_events=notify.events_to_csv(j["webhook_events"]),
+            )
+            # A job restored without its API keys can't run — keep it paused.
+            j["enabled"] = j["enabled"] and bool(j["source_key"] and j["dest_key"])
+            new_jobs.append(SyncJob(**j))
+        db.add_all(new_jobs)
+
+        restored = {
+            "webhook_enabled": "true" if notif["enabled"] else "false",
+            "webhook_events": notify.events_to_csv(notif["events"]),
+        }
+        if notif["webhook_url"]:  # blank keeps the current URL, as on the Settings form
+            restored["webhook_url"] = _encrypt_key(notif["webhook_url"])
+        for key, value in restored.items():
+            db.merge(Settings(key=key, value=value))
+        db.commit()
+
+        # Old caches hold private originals, and SQLite may hand their ids to
+        # the restored jobs.
+        for job_id in held:
+            remove_job(job_id)
+            await asyncio.to_thread(
+                shutil.rmtree, Path(CACHE_BASE) / f"job_{job_id}", ignore_errors=True
+            )
+        for job in new_jobs:
+            try:
+                schedule_job(job)
+            except Exception as exc:
+                logger.error(f"Could not schedule restored job {job.id}: {exc}")
+    finally:
+        for job_id in held:
+            release_job(job_id)
+
+    count = len(new_jobs)
+    logger.info(f"Configuration restored from a backup: {count} job(s)")
+    message = f"Restored {count} job{'' if count == 1 else 's'} and the notification settings."
+    if not config["has_secrets"]:
+        message += (" The backup has no API keys, so the jobs are paused — edit each job, "
+                    "enter its keys (and any custom webhook URL), then enable it.")
+    return _settings_redirect("success", message)
 
 
 def _upsert_setting(db: Session, key: str, value: str):

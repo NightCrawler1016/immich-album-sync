@@ -41,6 +41,8 @@ Immich A (private)  ──────────────▶  Immich B (pub
 - 🔔 **Webhook notifications** — get pinged on sync start/success/partial/failure; generic JSON that auto-formats for Discord & Slack, global or per-job
 - 📜 **Run history** — browse every sync over the last 30 days (or any window) and filter by job and status to pin down failures
 - 📦 **Support bundle** — one-click download of logs, sanitized config, and run history for troubleshooting
+- 💾 **Config backup & restore** — save every job and the notification settings to a versioned JSON file (API keys protected by your passphrase) and restore it on any newer version
+- 🔒 **Optional HTTPS** — serve TLS directly with your own certificate, or run behind an HTTPS reverse proxy. Off by default, so plain-HTTP LAN setups keep working
 
 ---
 
@@ -146,7 +148,7 @@ All Immich API keys entered in sync job forms are encrypted before being stored 
 
 - Never stored in plaintext (keys saved in plaintext by very old versions are encrypted automatically at startup)
 - Never rendered in HTML (form fields always show empty; a "Key stored securely" indicator is shown instead)
-- Decrypted only in memory, when needed — to run a sync, to test a connection, or to scrub the keys out of a support bundle
+- Decrypted only in memory, when needed — to run a sync, to test a connection, to scrub the keys out of a support bundle, or to download or restore a [configuration backup](#backup--restore) (where they are re-encrypted under your backup passphrase, or under this install's key on restore)
 - The destination key is handed to `immich-go` through its process environment (`IMMICH_GO_UPLOAD_API_KEY`), never on the command line, so it does not appear in process listings such as `ps`; `immich-go` output is also scrubbed of the key before it is written to the log
 
 If a stored key can no longer be decrypted (for example because `SECRET_KEY` changed), the sync fails with a clear "re-enter the API keys" message rather than sending garbage to Immich.
@@ -167,7 +169,35 @@ Generate a strong key: [1Password Generator](https://1password.com/password-gene
 
 ### Session Security
 
-Sessions are signed with `SECRET_KEY` using `itsdangerous` and expire after 24 hours of inactivity. Changing the password or username signs out all other sessions. The session cookie is `SameSite=Lax` but is **not** marked `Secure`, so it works on a plain-HTTP LAN; if you expose the app beyond your LAN, put it behind an HTTPS reverse proxy.
+Sessions are signed with `SECRET_KEY` using `itsdangerous` and expire after 24 hours of inactivity. Changing the password or username signs out all other sessions. The session cookie is `SameSite=Lax`. By default it is **not** marked `Secure`, so the app works on a plain-HTTP LAN; when you turn on [optional HTTPS](#optional-https) it is marked `Secure`, so browsers only ever send it over HTTPS. If you expose the app beyond your LAN, use HTTPS.
+
+### Optional HTTPS
+
+**HTTPS is off by default and entirely optional.** On a trusted home LAN, plain `http://` is fine, and you can skip this section. Turn it on if you reach the UI over a network you don't fully trust. There are two ways:
+
+**1. The container serves HTTPS itself.** Put a PEM certificate and private key somewhere inside the container (the appdata volume is easiest) and point two variables at them:
+
+```yaml
+    environment:
+      HTTPS_CERT_FILE: /app/appdata/certs/cert.pem   # certificate (full chain)
+      HTTPS_KEY_FILE: /app/appdata/certs/key.pem     # private key (unencrypted PEM)
+```
+
+Restart, then open **`https://`**`your-server:8080`. The same port 8080 now speaks HTTPS only, so `http://` stops working. The session cookie is marked `Secure` automatically. Both variables must be set; if only one is set the container logs a warning and stays on plain HTTP. If a file can't be read, the container stops with an error instead of quietly falling back to HTTP.
+
+No certificate yet? A self-signed one works (your browser will warn once, and you accept it):
+
+```bash
+mkdir -p /mnt/user/appdata/immich-album-sync/certs && cd "$_"
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+  -keyout key.pem -out cert.pem -subj "/CN=immich-album-sync"
+```
+
+Renewed certificates are picked up on container restart.
+
+**2. A reverse proxy handles HTTPS** (nginx, Caddy, Traefik, Nginx Proxy Manager, SWAG…). Leave the two variables above unset and set `SESSION_COOKIE_SECURE: "true"` so the session cookie is only ever sent over HTTPS. Then make sure the proxy forwards the original `Host` header (see [CSRF protection](#brute-force--csrf-protection)).
+
+> **Don't** set `SESSION_COOKIE_SECURE=true` if you open the UI over plain `http://`. The browser will refuse to send the cookie back, and you will be returned to the login page every time you sign in.
 
 ### Clickjacking Protection
 
@@ -205,6 +235,9 @@ Webhook notifications likewise mask server URL hosts and IP addresses in the err
 | `DB_PATH` | No | `/app/appdata/config.db` | SQLite database path |
 | `LOG_PATH` | No | `/app/appdata/logs/sync.log` | Sync log file path. Rotates at 10 MB, keeping 3 old files (`sync.log.1` … `sync.log.3`) |
 | `RUN_HISTORY_RETENTION_DAYS` | No | `90` | Days of run history to keep; older runs are pruned daily (the last 10 runs per job are always kept). `0` = keep forever |
+| `HTTPS_CERT_FILE` | No | _unset_ | Optional. Path inside the container to a PEM certificate. Together with `HTTPS_KEY_FILE` this makes port 8080 serve HTTPS (see [Optional HTTPS](#optional-https)) |
+| `HTTPS_KEY_FILE` | No | _unset_ | Optional. Path inside the container to the matching PEM private key |
+| `SESSION_COOKIE_SECURE` | No | `false` | Optional. `true` marks the session cookie `Secure`; use it only when an HTTPS reverse proxy sits in front. Leave it off for plain `http://` access |
 
 ---
 
@@ -259,7 +292,7 @@ services:
 | New Job | `/jobs/new` | Configure source server, destination server, album, and schedule |
 | Live Logs | `/logs` | Real-time streaming sync log with copy and support bundle download |
 | Run History | `/history` | Every run over a selectable window (default 30 days), filterable by job and status |
-| Settings | `/settings` | Change username and password; configure notifications |
+| Settings | `/settings` | Change username and password; configure notifications; back up and restore the configuration |
 
 ---
 
@@ -271,7 +304,7 @@ services:
 4. Use the **Test Connection** button to verify API key permissions before saving
 5. Select the source album name (populated from the test result)
 6. Set a cron schedule (e.g. `0 23 * * *` for 23:00 **UTC** daily) — see the schedule notes below
-7. Optionally enable **Clean up cache after upload** and/or **Mirror deletes** (see [How It Works](#how-it-works))
+7. Optionally enable **Clean up cache after upload** and/or **Mirror deletes** (see [Download cache](#download-cache) and [Mirror deletes](#mirror-deletes))
 8. Save — the job will run on schedule automatically. An invalid cron expression is rejected when you save
 
 ### Schedule notes
@@ -332,6 +365,62 @@ Non-Discord/Slack endpoints receive:
   "timestamp": "2026-07-04T02:00:07+00:00"
 }
 ```
+
+---
+
+## Backup & Restore
+
+**Settings → Backup & Restore** saves every sync job and the notification settings to one JSON file. You can restore it later on the same install, on a rebuilt container, or on a newer version of the app.
+
+**What's in a backup:** each job's name, servers, albums, schedule, enabled/paused state, *Mirror deletes* and *Clean up cache* options, and per-job notification settings, plus the global notification settings.
+**What's not:** your login (username/password), run history, the download cache, and the container's environment variables such as `SECRET_KEY`. Those belong to the install, not the configuration.
+
+### The passphrase
+
+- **With a passphrase** (8+ characters), the API keys and webhook URLs are included, encrypted with that passphrase. Restoring needs the same passphrase. **It can't be recovered**, so keep it somewhere safe.
+- **Without a passphrase**, the API keys and webhook URLs are left out entirely. After restoring, the jobs come back **paused**: edit each one, enter its keys (and its webhook URL, if it used a custom one), and re-enable it. The global webhook URL already saved on this install is kept; on a fresh install, re-enter it under **Settings → Notifications**.
+
+The secrets are deliberately **not** encrypted with `SECRET_KEY`. A backup therefore still restores after the container is rebuilt with a different `SECRET_KEY`; the keys are re-encrypted with the new install's key as they are restored.
+
+### Restoring
+
+Pick the file, enter its passphrase (if it has one), and click **Restore Backup**. A restore **replaces** all current sync jobs, their run history, and the notification settings (if the backup has no global webhook URL, the one already saved here is kept). Download a backup of the current setup first if you might want it back. Restore is all-or-nothing: a wrong passphrase, a damaged file, or an invalid schedule changes nothing. It is also refused while a sync is running.
+
+### Compatibility across versions
+
+Backups are designed to keep working across releases, including major ones:
+
+- The file names its own format (`"format": "immich-album-sync-backup"`) and carries a `format_version` number. New releases keep reading every older format version. A backup from a **newer** version than the app understands is rejected with a clear message rather than half-restored.
+- Fields are named after the setting, not after the app's internal database columns, so internal changes don't alter the file.
+- Fields the app doesn't recognise are ignored, and missing optional fields fall back to defaults.
+- The encryption parameters (PBKDF2-HMAC-SHA256, 600,000 iterations, random salt; Fernet tokens) are stored in the file itself, so future releases can still decrypt old backups after the defaults change.
+
+It's plain, readable JSON:
+
+```json
+{
+  "format": "immich-album-sync-backup",
+  "format_version": 1,
+  "created_at": "2026-10-17T12:00:00+00:00",
+  "app_version": "1.2.0",
+  "encryption": { "cipher": "fernet", "kdf": "pbkdf2-sha256", "iterations": 600000, "salt": "…", "check": "…" },
+  "notifications": { "enabled": true, "webhook_url": "gAAAAA…", "events": ["failed", "partial"] },
+  "jobs": [
+    {
+      "name": "Family Shared Sync",
+      "enabled": true,
+      "schedule": "0 3 * * *",
+      "source": { "url": "http://192.168.1.10:2283", "album": "Family Shared", "api_key": "gAAAAA…" },
+      "destination": { "url": "http://192.168.1.20:2283", "album": "Family Shared", "api_key": "gAAAAA…" },
+      "mirror_deletes": false,
+      "cleanup_cache": false,
+      "notifications": { "mode": "inherit", "webhook_url": null, "events": [] }
+    }
+  ]
+}
+```
+
+Without a passphrase, `encryption` and every `api_key` / `webhook_url` are `null`. Server URLs and album names are stored in plain text, so treat the file as private.
 
 ---
 
@@ -482,7 +571,7 @@ In the **Live Logs** page, click **Download Support Bundle** to get a ZIP contai
 | Sync stops mid-way with "partial" status | Upload error during a batch, some files failed to download, or Mirror deletes failed | Check the live log for the cause. Cached files still waiting to upload are kept — fix the error and re-run; completed batches won't re-upload |
 | Destination album has more photos than the source | The sync is add-only by default: photos removed from the source album, and photos added directly to the destination album, stay there | Enable **Mirror deletes** on the job (see [Mirror deletes](#mirror-deletes)) — it removes them from the destination album only, never from the server |
 | `403` "CSRF validation failed" when saving forms behind a reverse proxy | The proxy is not forwarding the original `Host` header | nginx: `proxy_set_header Host $http_host;` — Apache: `ProxyPreserveHost On` |
-| "Sync failed: a stored API key could not be decrypted" | `SECRET_KEY` changed since the keys were saved | Edit the job and re-enter the source and destination API keys (or restore the old `SECRET_KEY`) |
+| "An API key is missing or could not be decrypted" | `SECRET_KEY` changed since the keys were saved, or the job was restored from a backup made without a passphrase | Edit the job and re-enter the source and destination API keys (or restore the old `SECRET_KEY`) |
 | "Invalid schedule" when saving a job, or when re-enabling a paused job | The cron expression isn't valid | Fix the 5-field cron expression (see [Schedule notes](#schedule-notes)) |
 | Job runs at the wrong time of day | Schedules run in UTC, not your `TZ` | Convert the hour to UTC; use weekday names (`mon-fri`) rather than numbers (`0` = Monday here) |
 | Want to use a network share for cache | Default cache is on main appdata | Add a second Docker volume mapping and set `CACHE_PATH` (see [Cache on external storage](#cache-on-external-storage-or-a-different-disk)) |

@@ -54,11 +54,28 @@ chown -R "${PUID}:${PGID}" "$CACHE_DIR"/job_* 2>/dev/null || true
 echo "Appdata contents:"
 ls -la /app/appdata/ 2>&1 || echo "  (empty or not mounted)"
 echo ""
+
+# Optional native HTTPS — only when BOTH PEM files are given. They're copied to
+# a private dir owned by the runtime user because private keys are often
+# root-only (0600) and would be unreadable after the gosu drop.
+set -- --host 0.0.0.0 --port 8080 --log-level info
+if [ -n "${HTTPS_CERT_FILE:-}" ] && [ -n "${HTTPS_KEY_FILE:-}" ]; then
+    mkdir -p /tmp/tls
+    cp "$HTTPS_CERT_FILE" /tmp/tls/cert.pem && cp "$HTTPS_KEY_FILE" /tmp/tls/key.pem || {
+        echo "ERROR: cannot read HTTPS_CERT_FILE / HTTPS_KEY_FILE — they must be paths" \
+             "inside the container (e.g. /app/appdata/certs/cert.pem)."
+        exit 1
+    }
+    chown -R "${PUID}:${PGID}" /tmp/tls
+    chmod 600 /tmp/tls/key.pem
+    set -- "$@" --ssl-certfile /tmp/tls/cert.pem --ssl-keyfile /tmp/tls/key.pem
+    echo "HTTPS     : enabled (${HTTPS_CERT_FILE}) — open https://<host>:8080"
+elif [ -n "${HTTPS_CERT_FILE:-}" ] || [ -n "${HTTPS_KEY_FILE:-}" ]; then
+    echo "WARNING: HTTPS needs BOTH HTTPS_CERT_FILE and HTTPS_KEY_FILE — serving plain HTTP."
+fi
+
 echo "Starting uvicorn as ${PUID}:${PGID}..."
 echo "========================================"
 
 # Drop root and run the app as the unprivileged user.
-exec gosu "${PUID}:${PGID}" python -m uvicorn app.main:app \
-    --host 0.0.0.0 \
-    --port 8080 \
-    --log-level info
+exec gosu "${PUID}:${PGID}" python -m uvicorn app.main:app "$@"

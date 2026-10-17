@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - dev
+      - "test/**"   # trial branches → their own :test-<name> image, never :dev
   workflow_dispatch:  # allow manual trigger from GitHub UI
 
 env:
@@ -11,8 +12,32 @@ env:
   IMAGE_NAME: nightcrawler1016/immich-album-sync
 
 jobs:
+  smoke-test:
+    name: Smoke test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run smoke test
+        run: python tests/smoke_test.py
+
   build-and-push:
     name: Build dev Docker image
+    needs: smoke-test
+    # A manual run from any other branch would have no tag to push.
+    if: github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/heads/test/')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -38,12 +63,17 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=dev
-            type=sha,prefix=dev-,format=short
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=sha,prefix=dev-,format=short,enable=${{ github.ref == 'refs/heads/dev' }}
+            # test/framework-upgrade → :test-framework-upgrade
+            type=ref,event=branch,enable=${{ startsWith(github.ref, 'refs/heads/test/') }}
 
       - name: Determine app version
         id: appver
-        run: echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        # dev → dev-<sha7>; test/foo → test-foo-<sha7>
+        run: |
+          BRANCH="${GITHUB_REF_NAME//\//-}"
+          echo "version=${BRANCH}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -62,9 +92,7 @@ jobs:
         run: |
           echo "## Dev image published 🚀" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image:** \`ghcr.io/${{ env.IMAGE_NAME }}:dev\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Pull it with:" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags published:**" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "docker pull ghcr.io/${{ env.IMAGE_NAME }}:dev" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

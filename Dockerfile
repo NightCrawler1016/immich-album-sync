@@ -70,7 +70,7 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Fail the build on any syntax error, broken import, or dependency
-# incompatibility — the repo has no test suite, so this is the safety net.
+# incompatibility inside the real image (CI's tests/smoke_test.py runs outside it).
 RUN python -m compileall -q app && python -c "import app.main"
 
 # Pre-create appdata directories in the image as a fallback.
@@ -84,7 +84,10 @@ ENV APP_VERSION=${APP_VERSION}
 
 EXPOSE 8080
 
+# Works with or without the optional native HTTPS (self-signed certs accepted).
+# HTTP first: a TLS probe of the plain-HTTP listener logs a uvicorn warning every
+# run, while plain HTTP sent to the TLS listener fails silently.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD curl -fs http://localhost:8080/health || curl -fsk https://localhost:8080/health || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
