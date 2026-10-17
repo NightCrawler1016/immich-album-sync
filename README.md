@@ -33,6 +33,8 @@ Immich A (private)  ──────────────▶  Immich B (pub
 - 🍎 **Live Photo support** — automatically pairs `.HEIC` + `.MOV` files
 - 🔁 **Duplicate-safe** — uses `immich-go` for smart duplicate detection on the destination
 - ⚡ **Incremental & bandwidth-friendly** — checks the destination by checksum before downloading, so re-syncing an unchanged album transfers almost nothing
+- ➕ **Add-only by default** — photos removed from the source album are left alone on the destination unless you opt in to *Mirror deletes*
+- 🪞 **Optional Mirror deletes** — per-job, opt-in (experimental): keeps the destination album's contents matching the source album. Photos are only taken out of the album — never deleted from the destination server
 - 📱 **Mobile-responsive** — works on phones, tablets, and desktops
 - 🚀 **Multi-job** — sync multiple albums with different schedules and servers
 - 🔍 **API permission checker** — test and verify required Immich API key permissions per job
@@ -107,7 +109,7 @@ Immich A (private)  ──────────────▶  Immich B (pub
 | Port | `8080` → `8080` |
 | Path `/app/appdata` | `/mnt/user/appdata/immich-album-sync` |
 | Variable `SECRET_KEY` | A 32–64 character random string (required) |
-| Variable `TZ` | Your timezone (e.g. `America/New_York`) |
+| Variable `TZ` | Your timezone (e.g. `America/New_York`) — log timestamps only; schedules always run in UTC |
 
 ### Option C — docker-compose
 
@@ -122,7 +124,7 @@ services:
     volumes:
       - ./appdata:/app/appdata
     environment:
-      SECRET_KEY: "replace-this-with-a-32-to-64-char-random-string"
+      SECRET_KEY: "change-me-to-a-unique-random-32-64-char-string"  # replace — the container won't start with this placeholder
       TZ: "America/New_York"
 ```
 
@@ -142,9 +144,12 @@ On first login with the default credentials (`admin` / `admin`), the application
 
 All Immich API keys entered in sync job forms are encrypted before being stored in the SQLite database using **AES-128 (Fernet)** with a key derived from your `SECRET_KEY`. Keys are:
 
-- Never stored in plaintext
+- Never stored in plaintext (keys saved in plaintext by very old versions are encrypted automatically at startup)
 - Never rendered in HTML (form fields always show empty; a "Key stored securely" indicator is shown instead)
-- Decrypted only in memory at sync runtime
+- Decrypted only in memory, when needed — to run a sync, to test a connection, or to scrub the keys out of a support bundle
+- The destination key is handed to `immich-go` through its process environment (`IMMICH_GO_UPLOAD_API_KEY`), never on the command line, so it does not appear in process listings such as `ps`; `immich-go` output is also scrubbed of the key before it is written to the log
+
+If a stored key can no longer be decrypted (for example because `SECRET_KEY` changed), the sync fails with a clear "re-enter the API keys" message rather than sending garbage to Immich.
 
 ### SECRET_KEY Requirements
 
@@ -158,11 +163,15 @@ All Immich API keys entered in sync job forms are encrypted before being stored 
 
 Generate a strong key: [1Password Generator](https://1password.com/password-generator/) — select 32–64 characters with all character types.
 
-> **Important:** Changing `SECRET_KEY` after the initial setup will **invalidate all stored API keys** (they were encrypted with the old key) and log out all active sessions. You will need to re-enter API keys for every sync job.
+> **Important:** Changing `SECRET_KEY` after the initial setup will **invalidate all stored API keys and webhook URLs** (they were encrypted with the old key) and log out all active sessions. You will need to re-enter the API keys for every sync job, plus the global webhook URL (Settings → Notifications) and any per-job custom webhook URLs — until then, notifications silently stop.
 
 ### Session Security
 
-Sessions are signed with `SECRET_KEY` using `itsdangerous` and expire after 24 hours.
+Sessions are signed with `SECRET_KEY` using `itsdangerous` and expire after 24 hours of inactivity. Changing the password or username signs out all other sessions. The session cookie is `SameSite=Lax` but is **not** marked `Secure`, so it works on a plain-HTTP LAN; if you expose the app beyond your LAN, put it behind an HTTPS reverse proxy.
+
+### Clickjacking Protection
+
+Every response carries `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'`, so the UI cannot be embedded in another page's iframe (and therefore cannot be clickjacked). This also means it cannot be embedded in dashboard iframes such as Organizr or Homarr — open it in its own tab instead.
 
 ### Runs as Non-Root
 
@@ -170,12 +179,14 @@ The app process runs as an unprivileged user (`PUID:PGID`, default `99:100` = Un
 
 ### Brute-Force & CSRF Protection
 
-- **Login rate limiting** — repeated failed logins from an IP are throttled (10 failures within 15 minutes triggers a 5-minute lockout).
-- **CSRF protection** — state-changing requests are rejected unless their `Origin`/`Referer` matches the app's own host, on top of a `SameSite=Lax` session cookie.
+- **Login rate limiting** — repeated failed logins from an IP are throttled (10 failures within 15 minutes triggers a 5-minute lockout). The limiter is in memory and resets when the container restarts. **Behind a reverse proxy**, every client appears to come from the proxy's IP, so they all share one limit (and one lockout) — unless you set uvicorn's `FORWARDED_ALLOW_IPS` environment variable to your proxy's IP or subnet so the real client IP is taken from `X-Forwarded-For`. Never set it to `*` if port 8080 is also reachable directly, or anyone can spoof their IP.
+- **CSRF protection** — state-changing requests are rejected unless their `Origin`/`Referer` matches the app's own `Host`, on top of a `SameSite=Lax` session cookie. **Behind a reverse proxy**, the proxy must forward the original `Host` header (nginx: `proxy_set_header Host $http_host;` — Apache: `ProxyPreserveHost On`), otherwise every form submission is rejected with `403 CSRF validation failed`.
 
 ### Safe Support Bundles
 
-The downloadable support bundle never contains API keys, and server hostnames/IP addresses are masked in both `sync.log` and the job configs — so it is safe to share for troubleshooting.
+The downloadable support bundle is built to be safe to share for troubleshooting: API keys are removed, and server hostnames (including bare hostnames of your configured servers) and IPv4/IPv6 addresses are masked in `sync.log`, the job configs, and run error messages.
+
+Webhook notifications likewise mask server URL hosts and IP addresses in the error text they send.
 
 ---
 
@@ -184,15 +195,15 @@ The downloadable support bundle never contains API keys, and server hostnames/IP
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `SECRET_KEY` | ✅ Yes | _none — must set_ | 32–64 char random string for session signing and API key encryption. Container refuses to start without a real value. |
-| `TZ` | No | `UTC` | Container timezone (e.g. `America/New_York`) |
+| `TZ` | No | `UTC` | Container timezone (e.g. `America/New_York`). Affects `sync.log` timestamps only — cron schedules always run in UTC, and the web UI shows times in UTC |
 | `PUID` | No | `99` | User ID the app runs as (non-root). `99` = Unraid `nobody` |
 | `PGID` | No | `100` | Group ID the app runs as. `100` = Unraid `users` |
-| `CLEANUP_CACHE` | No | `false` | Delete cached files after final upload (`true`/`false`) |
+| `CLEANUP_CACHE` | No | `false` | `true` turns on *Clean up cache after upload* for every job: uploaded files are deleted right after upload instead of at the start of the next run (see [Download cache](#download-cache)) |
 | `CACHE_PATH` | No | `/app/appdata/cache` | Download cache directory (see [Cache on external storage](#cache-on-external-storage-or-a-different-disk)) |
 | `BATCH_SIZE_MB` | No | `10240` | Max MB to stage before uploading a batch (0 = unlimited) |
 | `BATCH_FILE_COUNT` | No | `0` | Max files per batch (0 = unlimited, size limit still applies) |
 | `DB_PATH` | No | `/app/appdata/config.db` | SQLite database path |
-| `LOG_PATH` | No | `/app/appdata/logs/sync.log` | Sync log file path |
+| `LOG_PATH` | No | `/app/appdata/logs/sync.log` | Sync log file path. Rotates at 10 MB, keeping 3 old files (`sync.log.1` … `sync.log.3`) |
 | `RUN_HISTORY_RETENTION_DAYS` | No | `90` | Days of run history to keep; older runs are pruned daily (the last 10 runs per job are always kept). `0` = keep forever |
 
 ---
@@ -232,7 +243,7 @@ services:
       - ./appdata:/app/appdata                     # database + logs (small, keep on fast drive)
       - /mnt/big-drive/sync-cache:/app/cache       # large cache on a different disk or share
     environment:
-      SECRET_KEY: "replace-with-your-random-key"
+      SECRET_KEY: "change-me-to-a-unique-random-32-64-char-string"  # replace — the container won't start with this placeholder
       TZ: "America/New_York"
       CACHE_PATH: /app/cache
 ```
@@ -259,19 +270,25 @@ services:
 3. Enter the **Destination Server** (your family/public Immich) URL and API key
 4. Use the **Test Connection** button to verify API key permissions before saving
 5. Select the source album name (populated from the test result)
-6. Set a cron schedule (e.g. `0 23 * * *` for 11 PM daily)
-7. Save — the job will run on schedule automatically
+6. Set a cron schedule (e.g. `0 23 * * *` for 23:00 **UTC** daily) — see the schedule notes below
+7. Optionally enable **Clean up cache after upload** and/or **Mirror deletes** (see [How It Works](#how-it-works))
+8. Save — the job will run on schedule automatically. An invalid cron expression is rejected when you save
+
+### Schedule notes
+
+- Schedules are standard 5-field cron (`minute hour day month weekday`) and **always run in UTC**, regardless of the `TZ` setting (which only affects log timestamps). Convert your local time to UTC when choosing the hour.
+- **Weekday numbers count from Monday:** `0` = Monday … `6` = Sunday — unlike standard cron, where `0` = Sunday. Use names to avoid surprises: `0 3 * * mon-fri`, `0 3 * * sun`.
 
 ### Required API Key Permissions
 
 | Server | Required Permissions |
 |---|---|
 | Source (Immich A) | `album.read`, `asset.read`, `asset.download` |
-| Destination (Immich B) | **All permissions** (full-access key — see note below) |
+| Destination (Immich B) | **All permissions** (full-access key — see note below). *Mirror deletes* additionally uses `albumAsset.delete`, which an all-permissions key already includes |
 
 > **Source note:** `asset.download` is a separate scope from `asset.read` — it is what actually permits downloading original files. A key with only `album.read` + `asset.read` passes metadata checks but fails every file download with `403 Forbidden`. `user.read` is **not** required on the source.
 
-> **Destination note:** Uploads run through [immich-go](https://github.com/simulot/immich-go), which requires a broad set of scopes and validates the connection via `GET /api/users/me` (so `user.read` is mandatory here). Its documented requirements include `user.read`, `asset.read`, `asset.statistics`, `asset.update`, `asset.upload`, `asset.copy`, `asset.replace`, `asset.delete`, `asset.download`, `album.create`, `album.read`, `albumAsset.create`, `server.about`, `stack.create`, `tag.asset`, and `tag.create`. Because this set changes between immich-go versions, the simplest reliable choice is an **all-permissions API key** on the destination. A narrowly-scoped key fails with `Missing required permission: …`. For family sharing, create a dedicated non-admin user on the destination and use *their* all-permissions key.
+> **Destination note:** Uploads run through [immich-go](https://github.com/simulot/immich-go), which requires a broad set of scopes and validates the connection via `GET /api/users/me` (so `user.read` is mandatory here). Its documented requirements include `user.read`, `asset.read`, `asset.statistics`, `asset.update`, `asset.upload`, `asset.copy`, `asset.replace`, `asset.delete`, `asset.download`, `album.create`, `album.read`, `albumAsset.create`, `server.about`, `stack.create`, `tag.asset`, and `tag.create`. Because this set changes between immich-go versions, the simplest reliable choice is an **all-permissions API key** on the destination. A narrowly-scoped key fails with `Missing required permission: …`. For family sharing, create a dedicated non-admin user on the destination and use *their* all-permissions key. If you enable *Mirror deletes*, the app also removes assets from the destination album itself, which needs `albumAsset.delete` (included in an all-permissions key).
 
 See [Immich API Key documentation](https://docs.immich.app/features/command-line-interface/#obtain-the-api-key) for how to create keys with specific permissions.
 
@@ -291,7 +308,7 @@ Get notified when a sync runs — configured entirely in the browser under **Set
 ### Security & privacy
 
 - Webhook URLs are **encrypted at rest** (same Fernet scheme as API keys) and are never rendered back into the page — the field shows "Saved securely" and stays blank; leave it blank to keep the current URL.
-- Notification payloads **never contain secrets** — no API keys, no server URLs (only the job name, album names, run counts, status, timestamps, and, for failures, the error message).
+- Notification payloads **never contain secrets** — no API keys, no server URLs (only the job name, album names, run counts, status, timestamps, and, for failed/partial runs, the error message — with server URL hosts and IP addresses masked).
 - A notification failure can never break a sync — the worst case is a warning in the log.
 
 ### Generic JSON payload
@@ -331,7 +348,7 @@ Instead of downloading the entire album before uploading anything, the engine:
 3. Clears the batch from the cache
 4. Repeats until all files are processed
 
-The **final batch** respects your `CLEANUP_CACHE` setting — intermediate batches are always cleared.
+The **final batch** respects the job's *Clean up cache after upload* setting (or `CLEANUP_CACHE`) — intermediate batches are always cleared. See [Download cache](#download-cache).
 
 ### Defaults
 
@@ -366,11 +383,35 @@ With the default 10 GB limit, syncs under 10 GB behave exactly as before (single
 1. At the scheduled time, the sync engine connects to **Immich A** via its REST API
 2. Finds the configured source album by name and lists all assets (including Live Photo `.MOV` companions)
 3. **Checksum pre-check** — asks **Immich B** which of those assets it already has (by SHA-1). Assets already present are added straight to the destination album via the API, with **no download or upload**; only genuinely-new assets continue to the next step
-4. Downloads the new originals to the local cache in rolling batches — once a batch reaches `BATCH_SIZE_MB` (default 10 GB) or `BATCH_FILE_COUNT`, it is immediately uploaded and cleared before the next batch begins
-5. Uploads each batch to **Immich B** using [`immich-go`](https://github.com/simulot/immich-go) (v0.32.0), which performs a second layer of duplicate detection on the destination
-6. Logs all activity to `/app/appdata/logs/sync.log`, viewable live in the browser
+4. Prunes the job's download cache to just the files that still need uploading (see [Download cache](#download-cache))
+5. Downloads the new originals to the local cache in rolling batches — once a batch reaches `BATCH_SIZE_MB` (default 10 GB) or `BATCH_FILE_COUNT`, it is immediately uploaded and cleared before the next batch begins
+6. Uploads each batch to **Immich B** using [`immich-go`](https://github.com/simulot/immich-go) (v0.32.0), which performs a second layer of duplicate detection on the destination
+7. If the job has **Mirror deletes** enabled, removes from the destination album anything that is no longer in the source album (see [Mirror deletes](#mirror-deletes))
+8. Logs all activity to `/app/appdata/logs/sync.log` (rotated at 10 MB, 3 old files kept), viewable live in the browser
 
-Re-syncing an unchanged album is nearly free: the checksum pre-check skips every already-synced asset before any bytes are transferred, so there is no wasted bandwidth or disk. The pre-check is best-effort — if it ever fails, the engine falls back to downloading everything and lets `immich-go` de-dupe on upload, so no asset is ever missed. Files already present in the cache are also skipped on re-download.
+Re-syncing an unchanged album is nearly free: the checksum pre-check skips every already-synced asset before any bytes are transferred, so there is no wasted bandwidth or disk. The pre-check is best-effort — if it ever fails, the engine falls back to downloading everything and lets `immich-go` de-dupe on upload, so a failed check never causes an asset to be skipped. One caveat: a photo sitting in the **destination's trash** counts as already present (Immich still holds it), so it won't reappear in the album until you restore it from Immich B's trash or the trash is emptied.
+
+A run finishes as **success**, **partial** (some files failed to download or upload, or Mirror deletes failed — whatever did transfer is kept), or **failed** (the run could not proceed at all, e.g. album not found or a bad API key).
+
+### Download cache
+
+- Each asset is cached in its own folder (`<CACHE_PATH>/job_<id>/files/<asset-id>/<filename>`), so two different photos that share a filename never overwrite each other. A Live Photo's still and motion file share one folder.
+- Downloads are written to a temporary `.part` file and renamed only once complete, so an interrupted download never leaves a truncated file behind.
+- At the start of every run, the job's cache is pruned to only the files that still need uploading. Files left over from an interrupted run are reused without re-downloading; anything else (already on the destination, or since removed from the source album) is deleted, so stale cached files are never uploaded again.
+- **Clean up cache after upload** (per job, or `CLEANUP_CACHE=true` for all jobs) only changes *when* uploaded files are deleted: right after a successful upload when on, or at the start of the next run when off. Files already on the destination are never re-downloaded either way.
+- Deleting a job also deletes its cache folder (deleting is refused while that job is syncing).
+
+### Mirror deletes
+
+By default the sync is **add-only**: removing a photo from the source album does not touch the destination. Enabling **Mirror deletes** on a job (opt-in, marked experimental) makes the destination album match the source album:
+
+- After uploading, every asset in the destination album that doesn't match an asset in the source album is **removed from the destination album**. That includes photos removed from the source album *and* photos someone added directly to the destination album.
+- An asset matches when its checksum is identical, **or** it has the same filename and a capture time within 5 seconds — the same rule `immich-go` uses to decide the destination already has a photo (e.g. a different-quality copy), so the two never undo each other.
+- It changes **album membership only** — nothing is trashed or deleted; the photos remain in the destination owner's library. Every removal is logged by filename and asset id, so it can be undone by re-adding those assets to the album.
+- **Upgrading:** in older versions this checkbox did nothing. To avoid surprise removals, the first start of this version switches it **off** on every existing job (logged as a warning) — tick it again on the jobs you want mirrored.
+- The destination album is matched by its **exact** name (case-sensitive), the same way `immich-go` picks the album to upload into.
+- **Safety guards:** it skips itself (with a warning in the log) if the source album listing is empty or lacks checksums, or if it would remove *every* asset in the destination album — a sign that something is wrong with a listing. As a consequence, emptying the source album completely will not empty the destination album; remove those photos by hand.
+- It needs the `albumAsset.delete` scope on the destination key (included in an all-permissions key). If the removal fails, the run is marked **partial**.
 
 ### Immich Server Compatibility
 
@@ -384,7 +425,7 @@ Works with **Immich v1/v2 and v3**. Immich v3.0.0 removed the embedded `assets` 
 |---|---|---|
 | `latest` | `main` | Stable production release |
 | `dev` | `dev` | Development builds — may be unstable |
-| `v1.2.3` | git tag | Pinned version releases |
+| `1.2.3`, `1.2`, `1` | git tag `v1.2.3` | Pinned version releases — note the image tags have **no** leading `v` |
 
 ```bash
 # Pull latest stable
@@ -415,12 +456,12 @@ docker run -p 8080:8080 \
 ### Download Support Bundle
 
 In the **Live Logs** page, click **Download Support Bundle** to get a ZIP containing:
-- `sync.log` — full sync log (server hostnames/IPs redacted)
+- `sync.log` — the current sync log (API keys removed; server hostnames and IPv4/IPv6 addresses masked)
 - `jobs.json` — job configurations (API keys redacted; URL hosts masked)
-- `sync_runs.json` — last 100 run records
+- `sync_runs.json` — last 100 run records (error messages redacted the same way)
 - `system_info.json` — Python version, immich-go version, paths
 
-> The bundle is safe to share for troubleshooting: API keys are removed, and server hostnames/IP addresses are masked in both the log and job configs.
+> The bundle is safe to share for troubleshooting: API keys are removed, and server hostnames (including bare hostnames of your configured servers) and IP addresses are masked in the log, job configs, and run error messages.
 
 ### Common Issues
 
@@ -436,7 +477,12 @@ In the **Live Logs** page, click **Download Support Bundle** to get a ZIP contai
 | `Assets : 0 in album` after upgrading Immich to v3 | Older image predates the Immich v3 API changes | Update to the latest image — album listing and uploads are v3-compatible now |
 | Album not visible after sync | Immich UI cache | Refresh your Immich browser tab or wait a moment |
 | Cache fills up during large sync | Batch size too large for disk | Lower `BATCH_SIZE_MB` (e.g. `2048` for 2 GB batches) or route cache to a larger disk |
-| Sync stops mid-way with "partial" status | Upload error during a batch | Cached files are kept — fix the error and re-run; completed batches won't re-upload |
+| Sync stops mid-way with "partial" status | Upload error during a batch, some files failed to download, or Mirror deletes failed | Check the live log for the cause. Cached files still waiting to upload are kept — fix the error and re-run; completed batches won't re-upload |
+| Destination album has more photos than the source | The sync is add-only by default: photos removed from the source album, and photos added directly to the destination album, stay there | Enable **Mirror deletes** on the job (see [Mirror deletes](#mirror-deletes)) — it removes them from the destination album only, never from the server |
+| `403` "CSRF validation failed" when saving forms behind a reverse proxy | The proxy is not forwarding the original `Host` header | nginx: `proxy_set_header Host $http_host;` — Apache: `ProxyPreserveHost On` |
+| "Sync failed: a stored API key could not be decrypted" | `SECRET_KEY` changed since the keys were saved | Edit the job and re-enter the source and destination API keys (or restore the old `SECRET_KEY`) |
+| "Invalid schedule" when saving a job, or when re-enabling a paused job | The cron expression isn't valid | Fix the 5-field cron expression (see [Schedule notes](#schedule-notes)) |
+| Job runs at the wrong time of day | Schedules run in UTC, not your `TZ` | Convert the hour to UTC; use weekday names (`mon-fri`) rather than numbers (`0` = Monday here) |
 | Want to use a network share for cache | Default cache is on main appdata | Add a second Docker volume mapping and set `CACHE_PATH` (see [Cache on external storage](#cache-on-external-storage-or-a-different-disk)) |
 
 ---
@@ -446,12 +492,14 @@ In the **Live Logs** page, click **Download Support Bundle** to get a ZIP contai
 This container pins [`immich-go`](https://github.com/simulot/immich-go) to **v0.32.0** for stability. The upload command used internally:
 
 ```bash
+IMMICH_GO_UPLOAD_API_KEY=DEST_KEY \
 immich-go upload from-folder \
   --server DEST_URL \
-  --api-key DEST_KEY \
   --into-album "Album Name" \
   --recursive /path/to/cache
 ```
+
+The API key is supplied through the `IMMICH_GO_UPLOAD_API_KEY` environment variable of the `immich-go` process rather than `--api-key`, so it never appears on the command line.
 
 > Note: flags must appear **after** `from-folder` (v0.31.0+ syntax). v0.32.0 adds **Immich v3 server compatibility** — it auto-detects the server version and remains backward compatible with Immich v2. (v0.31.0 uploads fail against Immich v3 with HTTP 400 — [immich-go#1372](https://github.com/simulot/immich-go/issues/1372).)
 

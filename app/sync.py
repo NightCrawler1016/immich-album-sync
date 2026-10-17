@@ -1,12 +1,13 @@
 import asyncio
+import contextlib
 import logging
+import logging.handlers
 import os
 import re
 import shutil
-import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 from .crypto import decrypt_secret
 from .immich_client import ImmichClient
@@ -48,19 +49,31 @@ def release_job(job_id: int) -> None:
 _BATCH_SIZE_BYTES: int = int(os.getenv("BATCH_SIZE_MB", "10240")) * 1024 * 1024  # default 10 GB
 _BATCH_FILE_COUNT: int = int(os.getenv("BATCH_FILE_COUNT", "0"))                 # default unlimited
 
+# Immich asset ids are UUIDs. They become cache folder names, so anything else
+# from the (untrusted) source server — e.g. "../.." or "/app" — is refused.
+_ASSET_ID_RE = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
+
+
+def _valid_asset_id(value) -> bool:
+    return isinstance(value, str) and bool(_ASSET_ID_RE.fullmatch(value))
+
 # --------------------------------------------------------------------------- #
 # Logging setup
 # --------------------------------------------------------------------------- #
 
 def _get_sync_file_logger() -> logging.Logger:
-    """Return a logger that writes to the sync log file."""
+    """Return a logger that writes to the (size-rotated) sync log file."""
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
     sync_logger = logging.getLogger("sync.file")
     if sync_logger.handlers:
         return sync_logger  # already configured
 
-    fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    # Rotate at 10 MB, keep 3 old files — hourly syncs on big albums otherwise
+    # grow the log without bound (and the live-log view / support bundle read it).
+    fh = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
     fh.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     )
@@ -78,53 +91,118 @@ def _safe_filename(name: Optional[str], fallback: str) -> str:
     Windows separators) and rejecting ``.``/``..`` keeps every download inside
     the job's cache directory — without this, a malicious or compromised source
     could return e.g. ``../../app/main.py`` and write outside the cache.
+    Control characters are replaced so a filename can't inject fake log lines.
     """
     if not name:
         return fallback
     base = os.path.basename(str(name).replace("\\", "/")).strip()
+    base = re.sub(r"[\x00-\x1f\x7f]", "_", base)
     if not base or base in (".", ".."):
         return fallback
     return base
 
 
-def _clear_dir_contents(path: Path) -> None:
-    """Delete everything inside *path* while keeping the directory itself.
+def _clear_dir_contents(path: Path, keep: frozenset = frozenset()) -> int:
+    """Delete everything inside *path* except names in *keep*; returns the count.
 
     Removing and recreating the directory races on network shares (SMB/CIFS):
     ``mkdir`` can raise ``FileExistsError`` immediately after ``rmtree`` because
     the directory-entry removal hasn't fully propagated. Clearing the contents
     in place never touches the directory inode, so it sidesteps the race.
     """
-    if not path.exists():
-        path.mkdir(parents=True, exist_ok=True)
-        return
+    removed = 0
     for child in path.iterdir():
+        if child.name in keep:
+            continue
         if child.is_dir() and not child.is_symlink():
             shutil.rmtree(child, ignore_errors=True)
         else:
-            try:
-                child.unlink()
-            except FileNotFoundError:
-                pass
+            child.unlink(missing_ok=True)
+        removed += 1
+    return removed
+
+
+def _parse_time(value) -> Optional[datetime]:
+    """Parse an Immich ISO timestamp ("…Z" or with offset) as an aware UTC datetime."""
+    try:
+        t = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+async def _mirror_album_removals(
+    dest: ImmichClient, album_name: str, source_assets: list, sync_log: logging.Logger
+) -> None:
+    """Remove from B's album every asset that isn't in A's album.
+
+    An asset counts as "in A" when its SHA-1 matches, or — immich-go's own rule
+    for "the server already has this photo" — it has the same filename and a
+    capture time within 5 s. Without the second test, when B holds a different
+    copy of a photo, immich-go adds B's copy and this step would remove it again,
+    every run.
+
+    Album membership only — nothing is trashed or deleted. Hidden Live Photo
+    motion parts that are album members on B are removed too: A's album never
+    holds them, Immich's album view hides them, and playback follows the still.
+    Refuses to act on a listing that can't be trusted, so a bad source response
+    can never empty the destination album.
+    """
+    keep = {a.get("checksum") for a in source_assets}
+    if not source_assets or None in keep:
+        sync_log.warning("   Mirror : skipped — source listing is empty or lacks checksums")
+        return
+    taken: dict = {}  # originalFileName -> capture times in A's album
+    for a in source_assets:
+        t = _parse_time(a.get("fileCreatedAt"))
+        if t:
+            taken.setdefault(a.get("originalFileName"), []).append(t)
+
+    def in_source(a: dict) -> bool:
+        if a["checksum"] in keep:
+            return True
+        t = _parse_time(a.get("fileCreatedAt"))
+        return t is not None and any(
+            abs((t - s).total_seconds()) <= 5 for s in taken.get(a.get("originalFileName"), ())
+        )
+
+    dest_album = await dest.get_album_by_name(album_name, exact=True)
+    if not dest_album:
+        return
+    dest_assets = await dest.get_album_assets(dest_album["id"])
+    stale = [a for a in dest_assets if a.get("checksum") and not in_source(a)]
+    if not stale:
+        return
+    if len(stale) == len(dest_assets):
+        sync_log.warning(
+            f"   Mirror : skipped — all {len(stale)} destination assets would be removed "
+            "(source/destination listing mismatch?)"
+        )
+        return
+    await dest.remove_assets_from_album(dest_album["id"], [a["id"] for a in stale])
+    # Name every removal so it can be undone by re-adding these ids to the album.
+    for a in stale:
+        sync_log.info(f"   Mirror : removed {a.get('originalFileName') or '?'} (id={a['id']})")
+    sync_log.info(
+        f"   Mirror : removed {len(stale)} asset(s) no longer in the source album "
+        "from the destination album (assets not deleted)"
+    )
 
 
 # --------------------------------------------------------------------------- #
 # Main sync entry point
 # --------------------------------------------------------------------------- #
 
-async def run_sync_job(
-    job,
-    progress_callback: Optional[Callable[[str], None]] = None,
-) -> dict:
+async def run_sync_job(job) -> dict:
     """
     Perform a full one-way sync for *job*.
 
     Flow:
       1. Find album on source (Immich A)
       2. Collect all assets + Live Photo companions
-      3. Download originals to cache
-      4. Upload to destination (Immich B) via immich-go
-      5. Optionally clean up cache
+      3. Skip assets B already has (checksum pre-check)
+      4. Download new originals to cache and upload them to B via immich-go
+      5. Optionally mirror removals (delete_sync) and clean up the cache
 
     Returns a results dict that maps to SyncRun columns.
     """
@@ -140,23 +218,11 @@ async def run_sync_job(
         "error_message": None,
     }
 
-    def log(msg: str, level: str = "info"):
-        getattr(sync_log, level)(msg)
-        if progress_callback:
-            try:
-                asyncio.get_event_loop().call_soon_threadsafe(
-                    lambda: progress_callback(msg)
-                )
-            except Exception:
-                pass
-
     # Decrypt API keys — handles both Fernet-encrypted and legacy plaintext values
     source_api_key = decrypt_secret(job.source_key, _SECRET_KEY)
     dest_api_key = decrypt_secret(job.dest_key, _SECRET_KEY)
 
-    job_cache_dir = Path(CACHE_BASE) / f"job_{job.id}"
-    files_dir = job_cache_dir / "files"
-    files_dir.mkdir(parents=True, exist_ok=True)
+    files_dir = Path(CACHE_BASE) / f"job_{job.id}" / "files"
 
     sync_log.info("=" * 70)
     sync_log.info(f"▶  SYNC START  [{job.name}]  {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
@@ -164,17 +230,24 @@ async def run_sync_job(
     sync_log.info(f"   Dest   : {job.dest_url}  album='{job.dest_album_name}'")
 
     try:
+        if not source_api_key or not dest_api_key:
+            raise ValueError(
+                "A stored API key could not be decrypted (SECRET_KEY changed?). "
+                "Re-enter the source and destination API keys in the job."
+            )
+        files_dir.mkdir(parents=True, exist_ok=True)
         source = ImmichClient(job.source_url, source_api_key)
+        dest = ImmichClient(job.dest_url, dest_api_key)
 
         # ------------------------------------------------------------------ #
         # Step 1 — Locate the album
         # ------------------------------------------------------------------ #
-        log(f"Searching for album '{job.source_album_name}' on source server…")
+        sync_log.info(f"Searching for album '{job.source_album_name}' on source server…")
         album = await source.get_album_by_name(job.source_album_name)
 
         if not album:
             raise ValueError(
-                f"Album '{job.source_album_name}' not found on {job.source_url}. "
+                f"Album '{job.source_album_name}' not found on the source server. "
                 "Check the album name and API key."
             )
 
@@ -183,18 +256,23 @@ async def run_sync_job(
 
         # ------------------------------------------------------------------ #
         # Step 2 — Collect assets + Live Photo companions
+        #
+        # Each asset is cached in its own subdirectory named by the still's id,
+        # so two assets sharing an originalFileName can't overwrite each other,
+        # while a Live Photo's still and motion part stay side by side.
         # ------------------------------------------------------------------ #
         assets = await source.get_album_assets(album_id)
         sync_log.info(f"   Assets : {len(assets)} in album")
         results["assets_found"] = len(assets)
 
-        log(f"Found {len(assets)} assets in album '{job.source_album_name}'")
-
         to_download: list[dict] = []
         seen_ids: set[str] = set()
 
         for asset in assets:
-            asset_id = asset["id"]
+            asset_id = asset.get("id")
+            if not _valid_asset_id(asset_id):
+                sync_log.warning(f"   Skip   : asset with malformed id {asset_id!r}")
+                continue
             if asset_id in seen_ids:
                 continue
             seen_ids.add(asset_id)
@@ -202,13 +280,14 @@ async def run_sync_job(
             filename = _safe_filename(asset.get("originalFileName"), f"{asset_id}.bin")
             to_download.append({
                 "id": asset_id,
+                "subdir": asset_id,
                 "filename": filename,
                 "checksum": asset.get("checksum"),
             })
 
             # Fetch Live Photo companion (.MOV paired with .HEIC)
             live_video_id = asset.get("livePhotoVideoId")
-            if live_video_id and live_video_id not in seen_ids:
+            if live_video_id and _valid_asset_id(live_video_id) and live_video_id not in seen_ids:
                 seen_ids.add(live_video_id)
                 try:
                     video_info = await source.get_asset_info(live_video_id)
@@ -218,6 +297,7 @@ async def run_sync_job(
                     )
                     to_download.append({
                         "id": live_video_id,
+                        "subdir": asset_id,
                         "filename": video_filename,
                         "checksum": video_info.get("checksum"),
                         "live_companion": True,
@@ -229,7 +309,7 @@ async def run_sync_job(
         sync_log.info(f"   Queue  : {len(to_download)} files to process (incl. companions)")
 
         # ------------------------------------------------------------------ #
-        # Step 2.5 — Skip assets the destination already has (checksum pre-check)
+        # Step 3 — Skip assets the destination already has (checksum pre-check)
         #
         # Immich identifies duplicates by the SHA-1 of the original file. Before
         # downloading anything, ask the destination which of these assets it
@@ -242,7 +322,6 @@ async def run_sync_job(
         # immich-go still de-dupes on upload, so correctness never depends on it.
         # ------------------------------------------------------------------ #
         new_items = to_download
-        dest = ImmichClient(job.dest_url, dest_api_key)
         checkable = [it for it in to_download if it.get("checksum")]
         try:
             if checkable:
@@ -253,15 +332,18 @@ async def run_sync_job(
                 filtered: list[dict] = []
                 for it in to_download:
                     res = check.get(it["id"])
-                    if res and res.get("action") == "reject" and res.get("assetId"):
-                        existing_dest_ids.append(res["assetId"])
-                    else:
+                    if not (res and res.get("action") == "reject" and res.get("assetId")):
                         filtered.append(it)
+                        continue
+                    # Already on B. A motion part stays linked to its still, so —
+                    # as on A — only stills and regular assets are album members.
+                    if not it.get("live_companion"):
+                        existing_dest_ids.append(res["assetId"])
                 new_items = filtered
 
                 if existing_dest_ids:
                     # Ensure those already-present assets are in the target album.
-                    dest_album = await dest.get_album_by_name(job.dest_album_name)
+                    dest_album = await dest.get_album_by_name(job.dest_album_name, exact=True)
                     if dest_album:
                         await dest.add_assets_to_album(dest_album["id"], existing_dest_ids)
                     else:
@@ -271,7 +353,7 @@ async def run_sync_job(
                         f"   Dedup  : {len(existing_dest_ids)} already on destination "
                         f"— ensured in album, skipped download"
                     )
-                sync_log.info(f"   New    : {len(new_items)} asset(s) need downloading")
+                sync_log.info(f"   New    : {len(new_items)} file(s) need downloading")
         except Exception as exc:
             sync_log.warning(
                 f"   Dedup  : destination pre-check failed ({exc}); "
@@ -279,8 +361,22 @@ async def run_sync_job(
             )
             new_items = to_download
 
+        # Prune the cache to what this run still needs. Anything else — assets
+        # already on B, or since removed from A, or orphaned by a deleted job —
+        # would otherwise be handed to immich-go again on the next upload and
+        # re-added to B's album. Cached files of still-pending assets are kept,
+        # so a run interrupted mid-way resumes without re-downloading.
+        try:
+            pruned = await asyncio.to_thread(
+                _clear_dir_contents, files_dir, frozenset(it["subdir"] for it in new_items)
+            )
+            if pruned:
+                sync_log.info(f"   Cache  : pruned {pruned} stale cache entr{'y' if pruned == 1 else 'ies'}")
+        except Exception as exc:
+            sync_log.warning(f"   Cache  : could not prune stale cache entries: {exc}")
+
         # ------------------------------------------------------------------ #
-        # Steps 3+4+5 — Download and upload in rolling batches
+        # Step 4 — Download and upload in rolling batches
         #
         # Files are staged in files_dir until a batch limit is reached, then
         # immediately uploaded and cleared before the next batch begins.
@@ -306,7 +402,7 @@ async def run_sync_job(
                 _parts.append(f"≤{_count_limit} files")
             sync_log.info(f"   Batch  : enabled ({' + '.join(_parts)} per batch)")
 
-        downloaded = skipped = failed = 0
+        downloaded = failed = 0
         total_uploaded = 0
         batch_files: list[Path] = []
         batch_bytes = 0
@@ -314,27 +410,26 @@ async def run_sync_job(
         total_items = len(new_items)
 
         for idx, item in enumerate(new_items):
-            dest_file = files_dir / item["filename"]
-            file_bytes = 0
+            is_last = idx == total_items - 1
+            dest_file = files_dir / item["subdir"] / item["filename"]
 
-            # Download or reuse cached file
             if dest_file.exists() and dest_file.stat().st_size > 0:
-                file_bytes = dest_file.stat().st_size
-                skipped += 1
+                # Downloaded by an earlier run that stopped before uploading it
+                batch_files.append(dest_file)
+                batch_bytes += dest_file.stat().st_size
             else:
                 try:
                     file_bytes = await source.download_original(item["id"], str(dest_file))
                     sync_log.info(f"   ↓  {item['filename']}  ({file_bytes / 1_048_576:.1f} MB)")
                     downloaded += 1
+                    batch_files.append(dest_file)
+                    batch_bytes += file_bytes
                 except Exception as exc:
                     sync_log.error(f"   ✗  {item['filename']}: {exc}")
                     failed += 1
-                    continue  # failed file — skip batch tracking
+                    # No `continue`: a failure on the LAST item must still flush
+                    # the batch, or every file downloaded before it is never uploaded.
 
-            batch_files.append(dest_file)
-            batch_bytes += file_bytes
-
-            is_last = (idx == total_items - 1)
             size_full = _size_limit > 0 and batch_bytes >= _size_limit
             count_full = _count_limit > 0 and len(batch_files) >= _count_limit
 
@@ -354,16 +449,14 @@ async def run_sync_job(
                     f"({batch_gb:.2f} GB) — {status_str} ───"
                 )
 
-            dir_file_count = sum(1 for f in files_dir.glob("*") if f.is_file())
-
-            if dir_file_count == 0:
-                sync_log.info("   Upload : No files in cache — skipping upload step")
+            if not batch_files:
+                sync_log.info("   Upload : No files in this batch — skipping upload step")
             else:
                 if is_batching:
-                    log(f"Uploading batch {batch_num} "
-                        f"({len(batch_files)} files, {batch_gb:.1f} GB)…")
+                    sync_log.info(f"Uploading batch {batch_num} "
+                                  f"({len(batch_files)} files, {batch_gb:.1f} GB)…")
                 else:
-                    log(f"Uploading {dir_file_count} files to '{job.dest_album_name}'…")
+                    sync_log.info(f"Uploading {len(batch_files)} files to '{job.dest_album_name}'…")
 
                 upload_result = await _run_immich_go_upload(
                     server=job.dest_url,
@@ -387,29 +480,19 @@ async def run_sync_job(
                             "cached files retained for next run"
                         )
                         break  # leave cache intact; next run will resume
+                elif is_batching:
+                    sync_log.info(
+                        f"   Batch {batch_num}: {batch_up} uploaded  "
+                        f"(running total: {total_uploaded})"
+                    )
                 else:
-                    if is_batching:
-                        sync_log.info(
-                            f"   Batch {batch_num}: {batch_up} uploaded  "
-                            f"(running total: {total_uploaded})"
-                        )
-                    else:
-                        sync_log.info(
-                            f"   Upload : {total_uploaded} files pushed to destination"
-                        )
-                    log(f"Upload complete — {total_uploaded} uploaded so far")
+                    sync_log.info(f"   Upload : {total_uploaded} files pushed to destination")
 
             # Clear intermediate batches always; clear final batch only if cleanup_cache=True
-            clear_now = (not is_last) or \
-                        (is_last and cleanup and results["status"] == "success")
-            if clear_now:
-                # Empty the staged files but keep files_dir itself. Removing and
-                # recreating the directory races on network shares (SMB/CIFS):
-                # mkdir() can raise FileExistsError right after rmtree() because
-                # the directory-entry removal hasn't propagated yet. A cleanup
-                # failure must never fail an already-successful upload.
+            if (not is_last) or (cleanup and results["status"] == "success"):
+                # A cleanup failure must never fail an already-successful upload.
                 try:
-                    _clear_dir_contents(files_dir)
+                    await asyncio.to_thread(_clear_dir_contents, files_dir)
                     if is_last:
                         sync_log.info("   Cache  : Cleaned up after successful upload")
                     else:
@@ -423,33 +506,35 @@ async def run_sync_job(
             batch_bytes = 0
 
         results["assets_downloaded"] = downloaded
-        # assets_skipped already holds the count skipped by the dedup pre-check;
-        # add the per-file cache hits (files already present locally) to it.
-        results["assets_skipped"] += skipped
         results["assets_failed"] = failed
         results["assets_uploaded"] = total_uploaded
+        if failed and results["status"] == "success":
+            results["status"] = "partial"
+            results["error_message"] = f"{failed} file(s) failed to download"
+
+        # ------------------------------------------------------------------ #
+        # Step 5 — Mirror deletes (opt-in): make B's album match A's album.
+        # Correctness depends only on the two listings, not on this run's
+        # uploads, so it runs even after a partial upload.
+        # ------------------------------------------------------------------ #
+        if job.delete_sync:
+            try:
+                await _mirror_album_removals(dest, job.dest_album_name, assets, sync_log)
+            except Exception as exc:
+                sync_log.error(f"   Mirror : could not remove stale assets: {exc}")
+                if results["status"] == "success":
+                    results["status"] = "partial"
+                    results["error_message"] = f"Mirror deletes failed: {exc}"
 
         sync_log.info(
-            f"   Done   : {downloaded} new  |  {results['assets_skipped']} skipped  |  "
+            f"   Done   : {downloaded} downloaded  |  {results['assets_skipped']} already on dest  |  "
             f"{failed} failed  |  {total_uploaded} uploaded"
         )
-        if is_batching and batch_num > 1:
-            log(
-                f"All {batch_num} batches complete — "
-                f"{total_uploaded} files uploaded to destination"
-            )
-        else:
-            log(
-                f"Sync complete — {downloaded} downloaded, "
-                f"{results['assets_skipped']} skipped (already on destination), "
-                f"{total_uploaded} uploaded"
-            )
 
     except Exception as exc:
         results["status"] = "failed"
         results["error_message"] = str(exc)
         sync_log.error(f"   ERROR  : {exc}")
-        log(f"SYNC FAILED: {exc}")
 
     finally:
         sync_log.info(
@@ -473,22 +558,20 @@ async def _run_immich_go_upload(
     sync_log: logging.Logger,
 ) -> dict:
     """
-    Call immich-go as a subprocess to upload files.
-    Supports immich-go v0.22+ command structure.
+    Call immich-go as a subprocess to upload every file under *source_dir*.
     Returns {"uploaded": int, "error": str|None}
     """
-    # immich-go v0.31+ syntax (flags go AFTER the subcommand, matching README examples):
-    #   immich-go upload from-folder --server URL --api-key KEY --into-album NAME --recursive DIR
-    # NOTE: placing --server/--api-key before "upload" as global flags breaks the
-    #       argument parser — they must follow the "from-folder" subcommand.
-    #       v0.32.0 (pinned in the Dockerfile) keeps this syntax and adds
-    #       Immich v3 server compatibility.
+    # immich-go v0.31+ syntax (flags go AFTER the subcommand):
+    #   immich-go upload from-folder --server URL --into-album NAME --recursive DIR
+    # The API key is passed through immich-go's environment binding
+    # (IMMICH_GO_UPLOAD_API_KEY — verified for the pinned v0.32.0; re-check on
+    # any immich-go bump), never argv, so it isn't visible in `ps` or
+    # /proc/<pid>/cmdline.
     cmd = [
         "immich-go",
         "upload",
         "from-folder",
         "--server", server,
-        "--api-key", api_key,
         "--into-album", album_name,
         "--recursive",
         source_dir,
@@ -502,56 +585,69 @@ async def _run_immich_go_upload(
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            env={**os.environ, "IMMICH_GO_UPLOAD_API_KEY": api_key},
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-
-        # Stream stdout in real time
-        uploaded_count = 0
-        stdout_lines = []
-
-        async def read_stdout():
-            nonlocal uploaded_count
-            async for line in proc.stdout:
-                text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
-                    sync_log.info(f"   [go]   {text}")
-                    stdout_lines.append(text)
-
-                    # Parse the final summary report lines (most accurate).
-                    # "added to album : 3"  — preferred: assets actually in the album
-                    m = re.search(r"added to album\s*:\s*(\d+)", text, re.IGNORECASE)
-                    if m:
-                        uploaded_count = int(m.group(1))
-                        continue
-
-                    # "uploaded successfully : 1"  — fallback if no album line appears
-                    m = re.search(r"uploaded successfully\s*:\s*(\d+)", text, re.IGNORECASE)
-                    if m:
-                        uploaded_count = max(uploaded_count, int(m.group(1)))
-
-        async def read_stderr():
-            async for line in proc.stderr:
-                text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
-                    sync_log.warning(f"   [go!]  {text}")
-
-        await asyncio.gather(read_stdout(), read_stderr())
-        await proc.wait()
-
-        if proc.returncode != 0:
-            return {
-                "uploaded": uploaded_count,
-                "error": f"immich-go exited with code {proc.returncode}. "
-                         "Check logs for details.",
-            }
-
-        return {"uploaded": uploaded_count, "error": None}
-
     except FileNotFoundError:
-        return {
-            "uploaded": 0,
-            "error": "immich-go binary not found. Rebuild the Docker image.",
-        }
+        return {"uploaded": 0, "error": "immich-go binary not found. Rebuild the Docker image."}
     except Exception as exc:
         return {"uploaded": 0, "error": str(exc)}
+
+    async def read_lines(stream):
+        while True:
+            try:
+                line = await stream.readline()
+            except ValueError:
+                # immich-go's no-UI progress ticker rewrites one line with "\r"
+                # and no newline; after ~64 KiB the reader overruns. That chunk
+                # is discarded and the stream stays usable.
+                continue
+            if not line:
+                return
+            # Keep only the last "\r" progress state; scrub the key defensively.
+            text = line.decode("utf-8", errors="replace").rsplit("\r", 1)[-1].strip()
+            if text:
+                yield text.replace(api_key, "[redacted-key]") if api_key else text
+
+    uploaded_count = 0
+
+    async def read_stdout():
+        nonlocal uploaded_count
+        async for text in read_lines(proc.stdout):
+            sync_log.info(f"   [go]   {text}")
+            # Parse the final summary report lines (most accurate).
+            # "added to album : 3"  — preferred: assets actually in the album
+            m = re.search(r"added to album\s*:\s*(\d+)", text, re.IGNORECASE)
+            if m:
+                uploaded_count = int(m.group(1))
+                continue
+            # "uploaded successfully : 1"  — fallback if no album line appears
+            m = re.search(r"uploaded successfully\s*:\s*(\d+)", text, re.IGNORECASE)
+            if m:
+                uploaded_count = max(uploaded_count, int(m.group(1)))
+
+    async def read_stderr():
+        async for text in read_lines(proc.stderr):
+            sync_log.warning(f"   [go!]  {text}")
+
+    try:
+        await asyncio.gather(read_stdout(), read_stderr())
+        await proc.wait()
+    except Exception as exc:
+        return {"uploaded": uploaded_count, "error": str(exc)}
+    finally:
+        # Never leave immich-go running behind an error or a cancelled run —
+        # an orphan would keep uploading into a cache the next run clears.
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
+
+    if proc.returncode != 0:
+        return {
+            "uploaded": uploaded_count,
+            "error": f"immich-go exited with code {proc.returncode}. "
+                     "Check logs for details.",
+        }
+    return {"uploaded": uploaded_count, "error": None}

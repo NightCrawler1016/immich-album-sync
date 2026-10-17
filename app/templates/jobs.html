@@ -176,7 +176,7 @@ async function toggleJob(jobId, btn) {
     const res = await fetch(`/jobs/${jobId}/toggle`, { method: 'POST' });
     const data = await res.json();
     if (typeof data.enabled !== 'undefined') location.reload();
-    else alert('Toggle failed');
+    else alert(data.error || 'Toggle failed');
   } catch(e) {
     alert('Request failed: ' + e);
   }

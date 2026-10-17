@@ -13,31 +13,10 @@ class ImmichClient:
 
     def __init__(self, base_url: str, api_key: str):
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
         self.headers = {
             "x-api-key": api_key,
             "Accept": "application/json",
         }
-
-    async def test_connection(self) -> dict:
-        """Ping the server and return version/info. Raises on failure."""
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # Try /api/server/about first (Immich v1.100+)
-            try:
-                resp = await client.get(
-                    f"{self.base_url}/api/server/about", headers=self.headers
-                )
-                resp.raise_for_status()
-                return resp.json()
-            except httpx.HTTPStatusError:
-                pass
-
-            # Fallback: /api/server-info
-            resp = await client.get(
-                f"{self.base_url}/api/server-info", headers=self.headers
-            )
-            resp.raise_for_status()
-            return resp.json()
 
     async def get_albums(self) -> list:
         """Return all albums visible to the API key owner."""
@@ -46,11 +25,16 @@ class ImmichClient:
             resp.raise_for_status()
             return resp.json()
 
-    async def get_album_by_name(self, album_name: str) -> Optional[dict]:
-        """Case-insensitive album lookup. Returns None if not found."""
+    async def get_album_by_name(self, album_name: str, *, exact: bool = False) -> Optional[dict]:
+        """Album lookup by name, case-insensitive unless *exact*. None if not found.
+
+        The destination must use exact=True: immich-go's --into-album matches the
+        exact name, so a case-insensitive hit could be a different album.
+        """
         albums = await self.get_albums()
         for album in albums:
-            if album.get("albumName", "").lower() == album_name.lower():
+            name = album.get("albumName", "")
+            if (name == album_name) if exact else (name.lower() == album_name.lower()):
                 return album
         return None
 
@@ -137,8 +121,8 @@ class ImmichClient:
         """
         Test the minimum required permissions for this API key.
 
-        role: "source"  → checks album.read + asset.read
-              "dest"    → checks album.read + album.write + asset.write (info only)
+        role: "source"  → checks album.read + asset.read + asset.download
+              "dest"    → checks album.read + user.read + album.create + asset.upload (info only)
 
         Returns (permissions_list, albums_list).
         Each permission entry: {name, desc, ok (True/False/None), detail}
@@ -381,7 +365,7 @@ class ImmichClient:
                         "detail": "Verified — destination connection will validate",
                     })
 
-                # ── album.write ──────────────────────────────────────────────
+                # ── album.create ─────────────────────────────────────────────
                 created_id: str | None = None
                 try:
                     resp = await client.post(
@@ -391,23 +375,23 @@ class ImmichClient:
                     )
                     if resp.status_code == 403:
                         results.append({
-                            "name": "album.write",
-                            "desc": "Create destination album and add assets to it",
+                            "name": "album.create",
+                            "desc": "Create the destination album",
                             "ok": False,
-                            "detail": "Permission denied — enable album.write scope on this API key",
+                            "detail": "Permission denied — enable album.create scope on this API key",
                         })
                     else:
                         resp.raise_for_status()
                         created_id = resp.json().get("id")
                         results.append({
-                            "name": "album.write",
-                            "desc": "Create destination album and add assets to it",
+                            "name": "album.create",
+                            "desc": "Create the destination album",
                             "ok": True, "detail": "Test album created and removed successfully",
                         })
                 except Exception as exc:
                     results.append({
-                        "name": "album.write",
-                        "desc": "Create destination album and add assets to it",
+                        "name": "album.create",
+                        "desc": "Create the destination album",
                         "ok": False, "detail": str(exc),
                     })
                 finally:
@@ -420,9 +404,9 @@ class ImmichClient:
                         except Exception:
                             pass
 
-                # ── asset.write (informational — can't test without uploading) ──
+                # ── asset.upload (informational — can't test without uploading) ──
                 results.append({
-                    "name": "asset.write",
+                    "name": "asset.upload",
                     "desc": "Upload new photos and videos to this server",
                     "ok": None,
                     "detail": "Cannot be verified without uploading a file — confirmed on first sync",
@@ -431,33 +415,39 @@ class ImmichClient:
         return results, albums
 
     async def download_original(self, asset_id: str, dest_path: str) -> int:
-        """
-        Stream-download the original file for an asset.
-        Returns the number of bytes written.
-        Skips download if file already exists with size > 0.
+        """Stream-download an asset's original file. Returns bytes written.
+
+        Writes to ``dest_path + ".part"`` and renames only after the stream
+        completes, so an interrupted download never leaves a truncated file
+        that a later run would treat as cached and upload as a corrupt original.
         """
         import aiofiles
 
-        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-            return os.path.getsize(dest_path)
-
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-
-        async with httpx.AsyncClient(
-            timeout=DOWNLOAD_TIMEOUT, follow_redirects=True
-        ) as client:
-            async with client.stream(
-                "GET",
-                f"{self.base_url}/api/assets/{asset_id}/original",
-                headers=self.headers,
-            ) as resp:
-                resp.raise_for_status()
-                size = 0
-                async with aiofiles.open(dest_path, "wb") as f:
-                    async for chunk in resp.aiter_bytes(chunk_size=65536):
-                        await f.write(chunk)
-                        size += len(chunk)
-                return size
+        part_path = dest_path + ".part"
+        try:
+            async with httpx.AsyncClient(
+                timeout=DOWNLOAD_TIMEOUT, follow_redirects=True
+            ) as client:
+                async with client.stream(
+                    "GET",
+                    f"{self.base_url}/api/assets/{asset_id}/original",
+                    headers=self.headers,
+                ) as resp:
+                    resp.raise_for_status()
+                    size = 0
+                    async with aiofiles.open(part_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(chunk_size=65536):
+                            await f.write(chunk)
+                            size += len(chunk)
+            os.replace(part_path, dest_path)
+            return size
+        except BaseException:  # includes cancellation — never leave a fragment behind
+            try:
+                os.remove(part_path)
+            except FileNotFoundError:
+                pass
+            raise
 
     async def bulk_upload_check(self, items: list) -> dict:
         """Ask this server which assets it already holds, keyed by SHA-1 checksum.
@@ -502,26 +492,25 @@ class ImmichClient:
             resp.raise_for_status()
             return resp.json()
 
-    async def add_assets_to_album(self, album_id: str, asset_ids: list) -> int:
-        """Add destination asset IDs to an album (idempotent).
+    async def add_assets_to_album(self, album_id: str, asset_ids: list) -> None:
+        """Add asset IDs to an album (idempotent), in chunks of 500."""
+        await self._album_assets_request("PUT", album_id, asset_ids)
 
-        Returns the number now present in the album (newly added + already there).
-        Chunks large lists to stay within server request limits.
+    async def remove_assets_from_album(self, album_id: str, asset_ids: list) -> None:
+        """Remove asset IDs from an album, in chunks of 500.
+
+        Only album membership changes — the assets themselves are not trashed.
+        Needs the albumAsset.delete scope (same endpoint on Immich v2 and v3).
         """
-        if not asset_ids:
-            return 0
-        present = 0
+        await self._album_assets_request("DELETE", album_id, asset_ids)
+
+    async def _album_assets_request(self, method: str, album_id: str, asset_ids: list) -> None:
         async with httpx.AsyncClient(timeout=60.0) as client:
             for i in range(0, len(asset_ids), 500):
-                chunk = asset_ids[i:i + 500]
-                resp = await client.put(
+                resp = await client.request(
+                    method,
                     f"{self.base_url}/api/albums/{album_id}/assets",
                     headers={**self.headers, "Content-Type": "application/json"},
-                    json={"ids": chunk},
+                    json={"ids": asset_ids[i:i + 500]},
                 )
                 resp.raise_for_status()
-                for item in resp.json():
-                    # success=True when newly added; error="duplicate" if already in album
-                    if item.get("success") or item.get("error") == "duplicate":
-                        present += 1
-        return present

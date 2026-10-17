@@ -10,17 +10,9 @@ import base64
 import hashlib
 import logging
 
-logger = logging.getLogger(__name__)
+from cryptography.fernet import Fernet, InvalidToken
 
-try:
-    from cryptography.fernet import Fernet, InvalidToken
-    _CRYPTO_AVAILABLE = True
-except ImportError:
-    _CRYPTO_AVAILABLE = False
-    logger.warning(
-        "cryptography package not installed — API keys stored unencrypted. "
-        "Rebuild the Docker image to install it."
-    )
+logger = logging.getLogger(__name__)
 
 
 def _fernet_key(secret_key: str) -> bytes:
@@ -30,31 +22,33 @@ def _fernet_key(secret_key: str) -> bytes:
 
 
 def encrypt_secret(plain: str, secret_key: str) -> str:
-    """Encrypt *plain* for database storage. Returns unchanged if crypto unavailable."""
-    if not plain or not _CRYPTO_AVAILABLE:
+    """Encrypt *plain* for database storage. Raises rather than storing plaintext."""
+    if not plain:
         return plain
-    try:
-        return Fernet(_fernet_key(secret_key)).encrypt(plain.encode("utf-8")).decode("utf-8")
-    except Exception as exc:
-        logger.error(f"Secret encryption failed: {exc}")
-        return plain
+    return Fernet(_fernet_key(secret_key)).encrypt(plain.encode("utf-8")).decode("utf-8")
 
 
 def decrypt_secret(stored: str, secret_key: str) -> str:
     """
     Decrypt a stored secret back to plaintext.
 
-    Gracefully falls back to returning *stored* unchanged when:
-    - The value was saved before encryption was introduced (legacy plaintext).
-    - The SECRET_KEY changed since the value was encrypted.
+    - Legacy plaintext (saved before encryption existed) is returned unchanged.
+    - A real Fernet token that won't decrypt means SECRET_KEY changed: that is
+      logged and "" is returned, so callers fail with a clear "key missing"
+      error instead of sending ciphertext to Immich as if it were the key.
     """
-    if not stored or not _CRYPTO_AVAILABLE:
+    if not stored:
         return stored
     try:
         return Fernet(_fernet_key(secret_key)).decrypt(stored.encode("utf-8")).decode("utf-8")
-    except Exception:
-        # Not a Fernet token — treat as legacy plaintext
-        return stored
+    except InvalidToken:
+        if not is_encrypted(stored):
+            return stored  # legacy plaintext
+        logger.error(
+            "A stored secret could not be decrypted — SECRET_KEY has probably "
+            "changed. Re-enter the affected API keys / webhook URLs."
+        )
+        return ""
 
 
 def is_encrypted(value: str) -> bool:

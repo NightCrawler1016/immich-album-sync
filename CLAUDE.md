@@ -55,15 +55,19 @@ No client-side build step — templates are shipped as-is.
 
 ```
 app/
-  main.py          # FastAPI app + EVERY route (~1060 lines). Auth, CSRF middleware,
-                   # jobs CRUD, log SSE stream, support bundle, settings, test-connection.
-  sync.py          # run_sync_job(): the whole sync flow + immich-go subprocess wrapper.
+  main.py          # FastAPI app + EVERY route (~1340 lines). Auth gate, CSRF + anti-framing
+                   # middleware, jobs CRUD, log SSE stream, support bundle, settings,
+                   # test-connection.
+  sync.py          # run_sync_job(): the whole sync flow + immich-go subprocess wrapper,
+                   # per-job run guard, rotating sync.log logger.
   immich_client.py # ImmichClient: async httpx wrapper for the Immich REST API.
   crypto.py        # Fernet encrypt/decrypt of secrets, key derived from SECRET_KEY.
   database.py      # SQLAlchemy engine/session, init_db() seeds default admin.
   models.py        # SyncJob, SyncRun, Settings (key/value) tables.
-  notify.py        # Webhook notifications: resolve config, build/format payload, send.
-  scheduler.py     # APScheduler wrapper: schedule_job / remove_job / runner.
+  notify.py        # Webhook notifications: resolve config, build/format payload, send;
+                   # also redact_text() (URL hosts/IPv4/IPv6), shared with the bundle.
+  scheduler.py     # APScheduler wrapper: cron_trigger / schedule_job / remove_job,
+                   # execute_run (shared run lifecycle), run-history pruning.
   templates/*.html # base, login, change_password, dashboard, jobs, job_form, logs, settings
   static/icon.png  # served unauthenticated at /static (login page needs it)
 Dockerfile         # python:3.12-slim; installs immich-go + gosu; runs entrypoint.sh
@@ -77,36 +81,53 @@ requirements.txt   # pinned deps
 
 ### Request flow / routes (all in `main.py`)
 
-Auth gate: every page checks `_logged_in(request)` (session has `user`) and redirects to
-`/login` if not. GET pages that render the app shell **also** redirect to
-`/change-password` when `session["must_change_password"]` is set. JSON/API endpoints
-return `401` instead of redirecting.
+Auth gate: the app-wide `_auth_gate` dependency (`FastAPI(dependencies=[...])`) is the
+**single** access control. For every path not in `_PUBLIC_PATHS` (`/health`, `/login`,
+`/logout`, `/change-password`) or under `/static`, it requires `_logged_in(request)`
+(session has `user` **and** its `epoch` matches the `session_epoch` setting) and blocks
+until a forced password change is done. HTML paths get a 302 to `/login` /
+`/change-password`; JSON/API paths (`_path_wants_json`) get `401` (or `403` while a
+password change is pending). **Route handlers do not
+re-check the session** — don't add per-route checks back, and don't add a new route
+outside the gate without thinking about it. (The two `/change-password` handlers check
+`_logged_in` themselves because that path is in `_PUBLIC_PATHS`.)
+
+> **⚠️ The gate must read `request.scope["path"]`, never `request.url.path`.** Starlette
+> (≤1.0.0, incl. the pinned 0.49.3) rebuilds `request.url` from the unvalidated `Host`
+> header, so `Host: x/static?` makes any path look public (CVE-2026-48710). Since handlers
+> no longer re-check, a regression here opens every GET route to anonymous users.
+
+Request bodies are capped at 64 KiB by the outermost `_BodySizeLimit` ASGI middleware
+(counts streamed bytes, so chunked bodies can't bypass it; over-limit → 413). It exists
+because Starlette 0.49's urlencoded form parser ignores `max_fields` (CVE-2026-54283,
+reachable unauthenticated via `POST /login`). Raise the cap if a route ever needs bigger
+bodies.
 
 | Route | Method | Purpose | Auth |
 |---|---|---|---|
 | `/health` | GET | Liveness for Docker HEALTHCHECK | none (intentional) |
 | `/static/*` | GET | App icon/favicon | none (intentional) |
-| `/login` | GET/POST | Login; rate-limited; sets session | public |
+| `/login` | GET/POST | Login; rate-limited; always runs bcrypt; clears + sets session (with epoch) | public |
 | `/logout` | GET | `session.clear()` | any |
-| `/change-password` | GET/POST | Forced first-login change | login |
-| `/` | GET | Dashboard (10 most-recent runs) | login + pw-change gate |
-| `/history` | GET | Run history: window (`?days=`, default 30, `0`=all) + `?job=`/`?status=` filters, 500-row cap | login + gate |
-| `/jobs` | GET | Job list | login + gate |
-| `/jobs/new` | GET/POST | Create job | login |
-| `/jobs/{id}/edit` | GET/POST | Edit job (blank key = keep existing) | login |
-| `/jobs/{id}/delete` | POST | Delete job | login |
-| `/jobs/{id}/toggle` | POST | Enable/disable (JSON) | login (401) |
-| `/jobs/{id}/run` | POST | Run now (spawns bg task, JSON) | login (401) |
-| `/logs` | GET | Live-log page | login + gate |
-| `/logs/stream` | GET | SSE tail of sync.log | login (401) |
-| `/logs/support-bundle` | GET | ZIP of redacted logs/config/runs/sysinfo | login |
-| `/settings` | GET | Settings page | login + gate |
-| `/settings/username` | POST | Change username | login |
-| `/settings/password` | POST | Change password (verifies current) | login |
-| `/settings/webhook` | POST | Save global webhook (blank URL = keep) | login |
-| `/api/test-webhook` | POST | Send a sample notification | login (401) |
-| `/api/test-connection` | POST | Probe an Immich server + check API-key scopes | login (401) |
-| `/api/jobs/{id}/status` | GET | Job status JSON | login (401) |
+| `/change-password` | GET/POST | Forced first-login change (no current-pw prompt). Redirects to `/settings` unless `must_change_password` is set | login (own check) |
+| `/` | GET | Dashboard (10 most-recent runs) | gate |
+| `/history` | GET | Run history: window (`?days=`, default 30, `0`=all) + `?job=`/`?status=` filters, 500-row cap | gate |
+| `/jobs` | GET | Job list | gate |
+| `/jobs/new` | GET/POST | Create job; invalid cron / webhook URL → form re-rendered with 400 | gate |
+| `/jobs/{id}/edit` | GET/POST | Edit job (blank key = keep existing); same validation | gate |
+| `/jobs/{id}/delete` | POST | Delete job + its `job_{id}` cache dir; refused (redirect to `/jobs?error=…`) while that job is syncing | gate |
+| `/jobs/{id}/toggle` | POST | Enable/disable (JSON); **400** + stays paused if the stored schedule is invalid | gate (401) |
+| `/jobs/{id}/run` | POST | Run now (spawns `execute_run` task, JSON); 409 if already running | gate (401) |
+| `/logs` | GET | Live-log page | gate |
+| `/logs/stream` | GET | SSE: last 200 lines (reads only a 256 KB tail), then follows; reopens on rotation | gate (401) |
+| `/logs/support-bundle` | GET | ZIP of redacted logs/config/runs/sysinfo (plain `def` → threadpool) | gate |
+| `/settings` | GET | Settings page | gate |
+| `/settings/username` | POST | Change username (blank rejected); bumps session epoch | gate |
+| `/settings/password` | POST | Change password (verifies current); bumps session epoch | gate |
+| `/settings/webhook` | POST | Save global webhook (blank URL = keep) | gate |
+| `/api/test-webhook` | POST | Send a sample notification | gate (401) |
+| `/api/test-connection` | POST | Probe an Immich server + check API-key scopes | gate (401) |
+| `/api/jobs/{id}/status` | GET | Job status JSON | gate (401) |
 
 ### Data model (`models.py`)
 
@@ -115,13 +136,17 @@ return `401` instead of redirecting.
   `cleanup_cache`, `enabled`, timestamps, plus notification columns
   `notify_override` (`inherit`|`off`|`custom`), `webhook_url` (Fernet ciphertext),
   `webhook_events` (CSV). **`source_key`/`dest_key`/`webhook_url` are Fernet
-  ciphertext**, not plaintext.
+  ciphertext**, not plaintext. `last_run_at`/`next_run_at` columns still exist but are
+  **no longer written** (UI reads next-run from APScheduler via `get_next_run_time`);
+  left in place rather than dropped, since SQLite column drops need a table rebuild.
+  `delete_sync` drives the Mirror deletes step (see sync flow).
 - `SyncRun` — per-run counters (found/downloaded/uploaded/skipped/failed), `status`
   (`running|success|partial|failed`), `error_message`, timestamps. Cascade-deleted with
   the job.
 - `Settings` — key/value store. Holds `admin_username`, `admin_password_hash` (bcrypt),
-  `password_changed` (`"true"`/`"false"`), and the global webhook config
-  `webhook_enabled` / `webhook_url` (encrypted) / `webhook_events` (CSV).
+  `password_changed` (`"true"`/`"false"`), `session_epoch` (integer string; see
+  Sessions below), and the global webhook config `webhook_enabled` / `webhook_url`
+  (encrypted) / `webhook_events` (CSV).
 
 > **⚠️ Adding a column to an existing table needs a migration.** SQLite `create_all`
 > only creates missing *tables*, never missing *columns*, so a model edit alone leaves
@@ -132,34 +157,79 @@ return `401` instead of redirecting.
 
 ### Sync flow (`sync.py::run_sync_job`)
 
-1. Decrypt both API keys (`decrypt_secret`, falls back to treating value as legacy
-   plaintext on any failure).
+1. Decrypt both API keys (`decrypt_secret`). Legacy plaintext (not a Fernet token) is
+   returned unchanged; a real Fernet token that won't decrypt (SECRET_KEY changed) returns
+   `""`, and the run **fails** immediately with "A stored API key could not be decrypted
+   … Re-enter the source and destination API keys" instead of sending ciphertext to Immich.
 2. Locate source album by name (case-insensitive), list assets, pair Live Photo `.MOV`
    companions via `livePhotoVideoId`. Listing is version-adaptive: album-detail
    `assets` array on Immich ≤ v2; Immich v3 removed it, so `get_album_assets` falls
    back to paginated `POST /api/search/metadata` with `albumIds` (needs `asset.read`,
    which source keys already have). `check_permissions` uses the same fallback to
-   find its sample asset.
+   find its sample asset. Each queued item gets a `subdir` = the **still's** asset id, so a
+   Live Photo's still and motion part share one cache folder.
 3. **Checksum pre-check** against the destination (`/api/assets/bulk-upload-check` by
-   SHA-1): assets already on B are added straight to the album (no download/upload);
-   only new assets are queued. Best-effort — on failure it downloads everything and lets
-   immich-go de-dupe.
-4. Download new originals into `${CACHE_PATH}/job_{id}/files` in **rolling batches**
-   (`BATCH_SIZE_MB` / `BATCH_FILE_COUNT`); each full batch is uploaded then cleared.
-5. Upload each batch via `immich-go upload from-folder --server URL --api-key KEY
-   --into-album NAME --recursive DIR` (flags **must** come after `from-folder`;
-   syntax unchanged in v0.32).
-6. Cache clearing: intermediate batches always cleared; final batch cleared only if
-   `cleanup_cache` and the run succeeded. Mid-batch upload error → stop early, keep cache
-   for the next run (status `partial`).
+   SHA-1): assets already on B are added straight to the album (no download/upload) —
+   **except** Live Photo motion parts, which stay linked to their still and are not made
+   album members (mirrors A). The destination album is looked up with `exact=True` (same
+   name match as immich-go's `--into-album`). Only new assets are queued. Best-effort — on
+   failure it downloads everything and lets immich-go de-dupe.
+4. **Start-of-run cache prune**: `_clear_dir_contents(files_dir, keep=<subdirs of queued
+   items>)` deletes everything in `${CACHE_PATH}/job_{id}/files` except folders of assets
+   still pending upload. This is load-bearing: immich-go uploads the whole folder
+   recursively, so any stale file (already on B, or since removed from A) would be
+   re-uploaded / re-added to B's album. Pending files from an interrupted run are reused.
+5. Download new originals into `files/<asset-id>/<filename>` in **rolling batches**
+   (`BATCH_SIZE_MB` / `BATCH_FILE_COUNT`). `download_original` is **atomic** — writes
+   `<file>.part`, `os.replace`s on completion, deletes the fragment on any error/cancel.
+   A download failure counts as `failed` and makes the run `partial`, but does **not**
+   `continue` past the batch-flush check, so a failure on the last item still uploads
+   the final batch.
+6. Upload each batch via `immich-go upload from-folder --server URL --into-album NAME
+   --recursive DIR` (flags **must** come after `from-folder`; syntax unchanged in v0.32).
+   The key goes in the child env as `IMMICH_GO_UPLOAD_API_KEY` (verified for v0.32.0 —
+   re-check on any immich-go bump), **never argv**. stdout/stderr are read line by line
+   with `readline()`; the `ValueError` from immich-go's `\r` progress ticker overrunning
+   the 64 KiB reader limit is swallowed, only the last `\r` segment of each line is kept,
+   and every line is scrubbed of the key before logging. On error/cancellation the
+   `finally` kills immich-go if it's still running.
+7. Cache clearing: intermediate batches always cleared; final batch cleared only if
+   cleanup (`job.cleanup_cache` **or** env `CLEANUP_CACHE=true`) and the run succeeded —
+   otherwise it's removed by the next run's prune. Mid-batch upload error → stop early,
+   keep cache for the next run (status `partial`).
+8. **Mirror deletes** (`job.delete_sync`, opt-in, UI-labelled experimental) —
+   `_mirror_album_removals`: removes from B's album (exact name) every asset whose
+   checksum isn't among the source album's assets, via `DELETE /api/albums/{id}/assets`
+   (`ImmichClient.remove_assets_from_album`, chunks of 500; needs `albumAsset.delete`).
+   **Album membership only — nothing trashed.** Also removes photos added to B's album
+   directly. A B asset counts as "in A" by checksum **or** by same `originalFileName` +
+   `fileCreatedAt` within 5 s — immich-go's own "server already has it" rule; without it,
+   when B holds a different copy, immich-go re-adds B's copy and the mirror removes it
+   again every run. Guards: skipped (warning) if the source listing is empty or any asset
+   lacks a checksum; skipped if it would remove **every** destination asset. Each removal
+   is logged by filename + id (reversible). Runs even after a partial upload (depends only
+   on the two listings). An exception marks the run `partial`. A one-time startup
+   migration (`Settings.mirror_deletes_v2`) switched `delete_sync` off on jobs that ticked
+   it while it was a no-op, so they opt in again under the real behavior.
 
-Two triggers reach `run_sync_job`: the APScheduler cron (`scheduler.py::
-_scheduled_sync_runner`) and the "Run now" button (`main.py::_run_background` via
-`asyncio.create_task`). See the concurrency gotcha below.
+Source asset ids (and `livePhotoVideoId`) must match the UUID pattern `_ASSET_ID_RE`
+before use — they become cache folder names, and the source server is untrusted.
+
+Two triggers reach `run_sync_job`, both via `scheduler.py::execute_run(job_id, run_id)`
+(the single run lifecycle: start notification, `run_sync_job`, record results, final
+notification, `release_job`): the APScheduler cron (`_scheduled_sync_runner` reserves the
+job, creates the `SyncRun`, awaits `execute_run`) and the "Run now" button (`main.py::
+job_run_now` reserves, creates the run, `asyncio.create_task(execute_run(...))`, holding
+the task in `_background_runs` so it can't be GC'd). The caller reserves via
+`try_acquire_job`; `execute_run` is the only place that releases (callers release only if
+creating the run row fails).
+
+`sync.log` is a `RotatingFileHandler` (10 MB × 3 backups: `sync.log.1..3`). Timestamps use
+the container's local `TZ`; everything else (UI, schedules) is UTC.
 
 ### Notifications (`notify.py`)
 
-- Both run paths (`_run_background`, `_scheduled_sync_runner`) fire a `start` event when
+- `scheduler.execute_run` (shared by cron and "Run now") fires a `start` event when
   the run begins and a final event mapped from status via `notify.STATUS_TO_EVENT`
   (`success`/`partial`/`failed`).
 - `notify.notify(db, job, event, results=, run=)` is the entry point. It loads the
@@ -172,7 +242,10 @@ _scheduled_sync_runner`) and the "Run now" button (`main.py::_run_background` vi
 - `build_payload(url, …)` picks the shape by URL host: Discord (`discord.com`/
   `discordapp.com`) → embeds; Slack (`hooks.slack.com`) → attachments; anything else →
   generic JSON. **Payloads carry no secrets** — job name, album names, counts, status,
-  timestamps, and (failures only) the error string. Never the API keys or webhook URL.
+  timestamps, and (failed/partial only) the error string — passed through
+  `redact_text` (URL hosts, IPv4, IPv6 masked) **before** truncation. Never the API keys or
+  webhook URL.
+- Per-job webhook URLs are validated with `is_valid_webhook_url` on save, like the global one.
 - `send_test(url)` powers the "Send test" buttons via `POST /api/test-webhook` (which
   falls back to the stored per-job/global URL when the field is left blank).
 - `_SECRET_KEY` is read from env at import (same as `sync.py`) to decrypt stored URLs.
@@ -189,8 +262,12 @@ _scheduled_sync_runner`) and the "Run now" button (`main.py::_run_background` vi
   chars. This is the guard that keeps the public default from ever being used. 16–31 chars
   boots with a warning; 32–128 is the recommended range.
 - Changing `SECRET_KEY` invalidates all stored API keys (can't decrypt) and logs out all
-  sessions. This is documented in README + the Unraid template — keep those in sync if
+  sessions. Runs then fail with a clear "re-enter the API keys" error (see sync flow
+  step 1). This is documented in README + the Unraid template — keep those in sync if
   the behavior changes.
+- The README/compose examples deliberately use the `change-me-…` placeholder so a
+  copy-pasted example is rejected by the boot guard. Don't introduce example keys that
+  don't start with `change-me` (the local-dev `docker run` examples are the exception).
 - Key derivation is a single `SHA-256(SECRET_KEY)` → base64 → Fernet key (`crypto.py::
   _fernet_key`). No salt/KDF; acceptable only because SECRET_KEY is meant to be
   high-entropy, not a human password.
@@ -232,6 +309,14 @@ Image: `ghcr.io/nightcrawler1016/immich-album-sync`.
    same facts and drift is the most common bug here.
 5. If a security control changed, re-check the README "Security" section — it makes
    specific claims (see below) that must remain true.
+6. **Bumping `IMMICH_GO_VERSION` or `GOSU_VERSION` in the Dockerfile** also requires
+   updating the per-arch SHA-256 pins next to it (amd64 + arm64, from the release's
+   checksums file) — the build runs `sha256sum -c` and fails otherwise. For immich-go, also
+   re-verify that `IMMICH_GO_UPLOAD_API_KEY` is still the env binding for
+   `upload --api-key` (otherwise immich-go gets no key and every upload fails).
+7. The Dockerfile runs `python -m compileall -q app && python -c "import app.main"` as a
+   build-time smoke test (the repo has no test suite). A broken import or dependency
+   mismatch fails the image build — read the build log, don't remove the step.
 
 ### Runtime env vars (keep XML ⇄ code ⇄ README in sync)
 
@@ -241,6 +326,10 @@ Image: `ghcr.io/nightcrawler1016/immich-album-sync`.
 `RUN_HISTORY_RETENTION_DAYS` (90; `0` = forever; in README + XML), `APP_VERSION`
 (build-time). Read in code but **not** documented in README/XML: `DOWNLOAD_TIMEOUT_SECONDS`
 (300, `immich_client.py`) and `WEBHOOK_TIMEOUT_SECONDS` (10, `notify.py`).
+`FORWARDED_ALLOW_IPS` is read by **uvicorn** itself (not app code); it is mentioned only in
+the README Security section (reverse-proxy rate-limiting note), deliberately not in the XML.
+`TZ` affects `sync.log` timestamps only — schedules are `CronTrigger(timezone="UTC")` and
+UI timestamps are naive UTC, labelled "UTC" by the `datetimefmt` filter.
 
 ---
 
@@ -253,31 +342,69 @@ if you change the code, keep the claim honest:
   (`main.py`, wired via `FastAPI(dependencies=[...])`): every non-public route (all
   POST/`/api/*`/`/logs/*` included) requires a session AND blocks until the change is done.
   Default password `admin` is blocked from reuse (min 8 chars). *(Fixed 2026-07 — this used
-  to be enforced only on GET pages, so POST/API routes could bypass it.)*
+  to be enforced only on GET pages, so POST/API routes could bypass it.)* The
+  `/change-password` form (which skips the current-password prompt) only works while
+  `must_change_password` is set; otherwise both GET and POST redirect to `/settings`, where
+  `/settings/password` verifies the current password.
 - **API-key encryption** — Fernet (AES-128-CBC + HMAC), key from SECRET_KEY. Keys are
   never rendered into HTML (forms post blank = "keep existing"; edit shows a "stored"
-  indicator). `crypto.encrypt/decrypt` **fail open to plaintext** if the `cryptography`
-  package is missing or a token doesn't decrypt — by design for legacy/roll-forward, but
-  it means "encrypted at rest" depends on the package being present and SECRET_KEY being
-  stable.
-- **Sessions** — signed cookie, `max_age=86400` (24h). Cookie is **not** marked `Secure`
-  (fine on plain-HTTP LAN; relevant if fronted by HTTPS — still open, see below).
+  indicator). `crypto` now **fails closed**: `cryptography` is a hard import (no
+  plaintext fallback), `encrypt_secret` raises rather than storing plaintext, and
+  `decrypt_secret` returns a value unchanged only if it isn't a Fernet token (legacy
+  plaintext, `is_encrypted`); an undecryptable token logs an error and returns `""`.
+  `startup()` re-encrypts any plaintext `source_key`/`dest_key` left by pre-encryption
+  builds, so "never stored in plaintext" holds for old installs too.
+- **Key handling at runtime** — keys are decrypted in memory for a sync, a
+  test-connection with a blank key field, and support-bundle scrubbing. The destination
+  key reaches immich-go via the child env (`IMMICH_GO_UPLOAD_API_KEY`), never argv — so not
+  in `ps` / `/proc/<pid>/cmdline` (`/proc/<pid>/environ` is readable only by the same uid
+  or root). immich-go output lines are scrubbed of the key before logging.
+- **Sessions** — signed cookie, `max_age=86400`, re-issued on each response (so 24 h of
+  *inactivity*). Cookie is **not** marked `Secure` (fine on plain-HTTP LAN; still open,
+  see below). **Session epoch revocation:** the cookie carries `epoch`; `_logged_in`
+  compares it with the `session_epoch` setting (one DB read per gated request) and clears
+  a stale session. `_bump_session_epoch` runs on both password-change paths and on username
+  change — every *other* session is signed out, the current one is re-stamped. Login
+  clears the session before setting `user`/`epoch`.
+- **Login** — bcrypt runs on every attempt (even for a wrong username), so response time
+  doesn't reveal a valid username. Blank usernames are rejected on change (they'd lock the
+  admin out).
 - **Login rate limiting** — in-memory per-IP, 10 fails / 15 min → 5-min lockout. Resets
-  on restart; behind a reverse proxy all clients share the proxy IP unless real IPs are
-  forwarded (there's no `X-Forwarded-For` handling — `request.client.host` is used).
+  on restart. `_record_login_failure` sweeps expired entries once per window, so memory is
+  bounded. Keyed on `request.client.host`; uvicorn's proxy-headers handling only trusts
+  `X-Forwarded-For` from `FORWARDED_ALLOW_IPS` (default `127.0.0.1`), so behind a reverse
+  proxy all clients share the proxy IP unless the operator sets it. **Documented in the
+  README only — no app-level handling.**
 - **CSRF** — `csrf_protect` middleware compares `Origin` (then `Referer`) host to the
   `Host` header on unsafe methods and **fails closed** (rejects when neither header is
   present or the host mismatches), backed by the `SameSite=Lax` cookie. No CSRF token.
-  *(Fixed 2026-07 — used to fail open on missing headers.)*
-- **Non-root** — `entrypoint.sh` starts as root, fixes ownership, `gosu`-drops to
-  PUID:PGID before uvicorn.
-- **Safe support bundle** — `/logs/support-bundle` redacts API keys (`[redacted]`) and
-  masks URL hosts + bare IPv4 in both `sync.log` and job configs. IPv6 addresses are
-  **not** masked by the current regexes.
+  *(Fixed 2026-07 — used to fail open on missing headers.)* Behind a reverse proxy the
+  original `Host` must be forwarded or every POST is 403 — README documents the nginx /
+  Apache settings.
+- **Anti-framing** — the same middleware sets `X-Frame-Options: DENY` and
+  `Content-Security-Policy: frame-ancestors 'none'` on every response. Deliberately only
+  `frame-ancestors`: a fuller CSP would block the Tailwind CDN and inline template scripts.
+  Side effect (documented in README): the UI can't be embedded in Organizr/Homarr iframes.
+- **Non-root** — `entrypoint.sh` starts as root, fixes `/app/appdata` ownership, chowns
+  the `CACHE_PATH` directory itself plus its `job_*` folders (never the user's whole
+  share recursively), then `gosu`-drops to PUID:PGID before uvicorn.
+- **Safe support bundle** — `/logs/support-bundle` applies `_scrub_job_secrets` (exact-
+  string replace of every current job's decrypted API keys, plus bare hostnames of each
+  job's source/dest URL, with lookarounds so `immich` doesn't mangle `immich-go`) and then
+  `notify.redact_text` (URL hosts, IPv4, IPv6 — candidates validated with `ipaddress` so
+  `12:34:56` times survive) to `sync.log` and every `sync_runs.json` error message. Job
+  configs get `[redacted]` keys and masked URL hosts. Only the **current** `sync.log` is
+  included (not `.1`–`.3`). Limit: keys/hosts of deleted jobs, or a key since replaced,
+  aren't known to the scrubber — acceptable now that the key never reaches the log via argv.
+- **Webhook payloads** — error text goes through `notify.redact_text` (URL hosts/IPs; not
+  bare hostnames).
+- **Build supply chain** — Dockerfile verifies immich-go and gosu downloads against pinned
+  per-arch SHA-256s (`sha256sum -c`); unknown arch fails the build instead of silently
+  installing the amd64 binary.
 
-### Security review status (verified review, 2026-07)
+### Security review status (verified reviews, 2026-07 and 2026-10)
 
-**Fixed and shipped to `:latest` (commit `36da370`)**
+**Fixed 2026-07 — shipped to `:latest` (commit `36da370`)**
 - ✅ **`must_change_password` bypass** — closed via the app-wide `_auth_gate` dependency.
 - ✅ **Default/weak `SECRET_KEY`** — startup now refuses to boot on any `change-me*`
   placeholder / unset / <16-char key (was warn-only).
@@ -286,43 +413,81 @@ if you change the code, keep the claim honest:
 - ✅ **CSRF fail-open** — now fails closed on missing/mismatched `Origin`/`Referer`.
 - ✅ **Interrupted runs stuck `running`** — reconciled to `failed` on startup.
 
-**Still open — Medium (safe to do; no UX trade-off)**
-- **immich-go gets the API key as `--api-key` argv** (`sync.py` `_run_immich_go_upload`) →
-  readable via `/proc`. Pass via child-process env instead. **This currently makes the
-  README's "keys decrypted only in memory at sync time" claim untrue — fix the code or
-  soften the README.**
-- **Dockerfile downloads immich-go + gosu with no checksum/signature check** (`Dockerfile`).
-  Pin SHA-256 per arch and `sha256sum -c` before install.
-- **Support-bundle redaction (`_redact_text`) masks hosts/IPv4 but not API-key tokens** and
-  not IPv6; if immich-go ever echoes the key it lands in the shareable `sync.log`. **This
-  makes the README's "support bundle never contains API keys" claim not fully guaranteed.**
-  Do an exact-string replace of the known key value at log-write time.
+**Fixed 2026-10 (dev branch)**
+- ✅ **API key on immich-go argv** → passed as `IMMICH_GO_UPLOAD_API_KEY` in the child env;
+  immich-go output scrubbed of the key.
+- ✅ **Unverified immich-go/gosu downloads** → per-arch SHA-256 pins + `sha256sum -c`.
+- ✅ **Support-bundle redaction gaps** → API key values, bare configured hostnames, IPv6
+  masked; `sync_runs.json` error messages redacted too.
+- ✅ **Password change didn't invalidate old sessions** → session epoch (also bumped on
+  username change).
+- ✅ **`/change-password` usable any time without the current password** → restricted to
+  the forced first-login change.
+- ✅ **Username timing oracle** at login → bcrypt always runs.
+- ✅ **Blank username could lock the admin out** → rejected.
+- ✅ **Unbounded login-limiter memory** → periodic sweep of expired entries.
+- ✅ **Clickjacking** → `X-Frame-Options: DENY` + CSP `frame-ancestors 'none'`.
+- ✅ **Webhook error text leaked server hosts/IPs** to third parties → `redact_text`.
+- ✅ **crypto failed open** (plaintext on missing package / ciphertext used as key) → fails
+  closed; legacy plaintext keys re-encrypted at startup; undecryptable keys fail the run
+  with a clear message.
+- ✅ **Invalid cron saved silently / `job_toggle` swallowed errors** → `cron_trigger`
+  validation on save (form 400) and toggle (JSON 400, job stays paused). Per-job webhook
+  URLs validated like the global one.
+- ✅ **`sync.log` grew unbounded** → `RotatingFileHandler` 10 MB × 3; live view reads only
+  the tail and follows rotation.
+- ✅ **Same-`originalFileName` cache collisions** → per-asset `files/<asset-id>/` subdirs.
+- ✅ **Stale cache re-fed to immich-go every run** (re-added photos removed from A back
+  into B's album when cleanup was off) → start-of-run prune to pending files.
+- ✅ **Download failures reported `success`; failure on the last item skipped the final
+  batch upload** → `partial`, and the final batch always flushes.
+- ✅ **Non-atomic downloads** (truncated file later treated as cached) → `.part` + rename.
+- ✅ **immich-go `\r` progress overflowed the stream reader on long uploads; orphaned
+  immich-go on error/cancel** → tolerant `readline` loop; kill in `finally`.
+- ✅ **Deleting a job left its cached private originals** (SQLite can reuse the id) →
+  cache dir deleted; delete refused (redirect with a message) while the job is syncing.
+- ✅ **Pre-check added Live Photo motion parts to B's album** → only stills/regular assets.
+- ✅ **"Mirror deletes" checkbox did nothing** → implemented (`_mirror_album_removals`).
+- ✅ **Dependency CVEs** (python-multipart unauthenticated DoS) → fastapi 0.120.4,
+  starlette 0.49.3 (explicit pin), python-multipart 0.0.32.
+- ✅ **Dead code** removed: `ImmichClient.test_connection`, `progress_callback` (with its
+  deprecated `asyncio.get_event_loop()`), `_require_login`, `next_run_at`/`last_run_at`
+  writes, per-route auth re-checks. "Run now" and cron share `scheduler.execute_run`.
 
 **Still open — Medium (needs a decision — interacts with plain-HTTP LAN use)**
-- **Session cookie not `Secure`** (starlette default `https_only=False`) — add
-  `https_only`/`SESSION_COOKIE_SECURE`, but gate it so plain-HTTP LAN deploys still work.
-- **Password change doesn't invalidate old sessions** — cookies are stateless `{user}`; add a
-  credential-version in the session payload and bump it on password change.
+- **Session cookie not `Secure`** (starlette default `https_only=False`) — add an opt-in
+  `https_only`/`SESSION_COOKIE_SECURE`, gated so plain-HTTP LAN deploys still work.
+- **Default `admin`/`admin` first-claim** — on a fresh install, whoever reaches the UI first
+  can log in with the default and set the password. Options: random initial password
+  printed to the container log, or an initial-password env var.
 
 **Still open — Low / polish**
-- Rate limiter keys on `request.client.host` → collapses to one bucket (and a DoS lever)
-  behind a reverse proxy; no `X-Forwarded-For` handling.
+- **Starlette 0.49.3 has known CVEs** (CVE-2026-48710 Host-header URL confusion,
+  CVE-2026-54283 form `max_fields` ignored). Both are mitigated in app code (gate on
+  `scope["path"]`; `_BodySizeLimit`), but the real fix is Starlette ≥1.3.1, which needs a
+  newer FastAPI **and** rewriting all 12 `templates.TemplateResponse(name, {"request": …})`
+  calls to the `TemplateResponse(request, name, ctx)` signature Starlette 1.x requires —
+  do it in one change and smoke-test every page.
+- Rate limiter keys on `request.client.host` → one shared bucket (and a lockout DoS lever)
+  behind a reverse proxy unless `FORWARDED_ALLOW_IPS` is set. **Documented only** (README);
+  no app-level handling.
 - `download_original` has no per-asset size ceiling — a hostile source can fill the disk.
 - `http://` server URLs accepted with no warning → API key sent cleartext. (TLS verify is
   correctly **on** for `https://` — don't add an insecure toggle.)
 - CI actions pinned by mutable tag, not commit SHA.
-- `sync_runs` now has retention: `scheduler.prune_run_history()` deletes runs older than
+- **Query-string flash reflection** — `/settings?success=…` / `?error=…` text is rendered
+  from the URL (autoescaped, so no XSS, but a crafted link can show arbitrary text in the
+  app's UI). Use fixed message codes instead.
+- **Assets trashed on the destination are never restored** — the checksum pre-check sees
+  them as "already on B", so they're added to the album but stay in B's trash.
+- **Live Photo companion lookups are sequential N+1** (`get_asset_info` per Live Photo in
+  `run_sync_job` step 2) — slow on big albums; could be batched/concurrent.
+- A fresh `httpx.AsyncClient` per call (no pooling).
+- `sync_runs` retention: `scheduler.prune_run_history()` deletes runs older than
   `RUN_HISTORY_RETENTION_DAYS` (default 90; `0` = keep forever), always keeping the last
   `_HISTORY_PER_JOB_FLOOR` (10) per job. Runs once on startup and daily at 03:30 UTC (an
   APScheduler job id `maintenance_prune_history`). Reads stay fast via
-  `ix_sync_runs_started_at` / `ix_sync_runs_job_started`. **`sync.log` still grows
-  unbounded** (no rotation) — that's the remaining follow-up here.
-- Same-`originalFileName` assets collide in cache (one silently skipped) — namespace the
-  cache filename with the asset id.
-- `decrypt_secret` swallows all exceptions and returns ciphertext as if plaintext; invalid
-  cron saved silently (job never runs); `job_toggle` swallows scheduling errors; deprecated
-  `asyncio.get_event_loop()` in the progress callback; `ImmichClient.test_connection` is dead
-  code; a fresh `httpx.AsyncClient` per call (no pooling).
+  `ix_sync_runs_started_at` / `ix_sync_runs_job_started`. (Info, not an open issue.)
 - **SSRF by design**: `test-connection` and the sync engine fetch operator-supplied URLs —
   acceptable for a single-admin tool, just be aware.
 
