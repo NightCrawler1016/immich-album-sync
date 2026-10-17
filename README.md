@@ -389,7 +389,9 @@ With the default 10 GB limit, syncs under 10 GB behave exactly as before (single
 7. If the job has **Mirror deletes** enabled, removes from the destination album anything that is no longer in the source album (see [Mirror deletes](#mirror-deletes))
 8. Logs all activity to `/app/appdata/logs/sync.log` (rotated at 10 MB, 3 old files kept), viewable live in the browser
 
-Re-syncing an unchanged album is nearly free: the checksum pre-check skips every already-synced asset before any bytes are transferred, so there is no wasted bandwidth or disk. The pre-check is best-effort — if it ever fails, the engine falls back to downloading everything and lets `immich-go` de-dupe on upload, so a failed check never causes an asset to be skipped. One caveat: a photo sitting in the **destination's trash** counts as already present (Immich still holds it), so it won't reappear in the album until you restore it from Immich B's trash or the trash is emptied.
+Re-syncing an unchanged album is nearly free: the checksum pre-check skips every already-synced asset before any bytes are transferred, so there is no wasted bandwidth or disk. The pre-check is best-effort — if it ever fails, the engine falls back to downloading everything and lets `immich-go` de-dupe on upload, so a failed check never causes an asset to be skipped.
+
+**Server B is a replica, not a primary library.** It's meant to mirror whatever albums you sync to it and can be wiped and rebuilt at any time — just re-run your jobs. So the sync never restores anything from B's trash: a photo you trash on B counts as already present until B's trash is emptied, and the next sync after that uploads it fresh. If you remove a photo from A's album and later add it back, the next sync puts it back in B's album like any other new photo.
 
 A run finishes as **success**, **partial** (some files failed to download or upload, or Mirror deletes failed — whatever did transfer is kept), or **failed** (the run could not proceed at all, e.g. album not found or a bad API key).
 

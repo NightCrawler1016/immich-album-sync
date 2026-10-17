@@ -457,9 +457,14 @@ if you change the code, keep the claim honest:
 **Still open — Medium (needs a decision — interacts with plain-HTTP LAN use)**
 - **Session cookie not `Secure`** (starlette default `https_only=False`) — add an opt-in
   `https_only`/`SESSION_COOKIE_SECURE`, gated so plain-HTTP LAN deploys still work.
-- **Default `admin`/`admin` first-claim** — on a fresh install, whoever reaches the UI first
-  can log in with the default and set the password. Options: random initial password
-  printed to the container log, or an initial-password env var.
+
+**Owner decisions — by design, don't "fix" (2026-10)**
+- **Default `admin`/`admin` on a fresh install stays.** Requirement instead: nothing but the
+  forced password change is reachable until it's done (enforced by `_auth_gate`).
+- **Assets trashed on the destination are never restored.** Server B is a disposable
+  replica the user can wipe and re-sync; a trashed asset counts as "already on B" until
+  B's trash is emptied, then the next sync uploads it fresh. A photo removed from A and
+  later re-added is put back into B's album by the pre-check like any new photo.
 
 **Still open — Low / polish**
 - **Starlette 0.49.3 has known CVEs** (CVE-2026-48710 Host-header URL confusion,
@@ -478,8 +483,6 @@ if you change the code, keep the claim honest:
 - **Query-string flash reflection** — `/settings?success=…` / `?error=…` text is rendered
   from the URL (autoescaped, so no XSS, but a crafted link can show arbitrary text in the
   app's UI). Use fixed message codes instead.
-- **Assets trashed on the destination are never restored** — the checksum pre-check sees
-  them as "already on B", so they're added to the album but stay in B's trash.
 - **Live Photo companion lookups are sequential N+1** (`get_asset_info` per Live Photo in
   `run_sync_job` step 2) — slow on big albums; could be batched/concurrent.
 - A fresh `httpx.AsyncClient` per call (no pooling).
