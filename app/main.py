@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -130,9 +131,9 @@ def _bump_session_epoch(db: Session, request: Request) -> None:
 
 def _auth_gate(request: Request):
     # Route handlers rely on this gate and do not re-check the session.
-    # Use the routed path, NOT request.url.path: Starlette rebuilds request.url
-    # from the unvalidated Host header, so "Host: x/static?" would make any
-    # path look public (CVE-2026-48710).
+    # Use the routed path, NOT request.url.path: Starlette <1.0.1 rebuilt
+    # request.url from the unvalidated Host header, so "Host: x/static?" made any
+    # path look public (CVE-2026-48710). scope["path"] can't be spoofed that way.
     path = request.scope["path"]
     if path in _PUBLIC_PATHS or path.startswith("/static"):
         return
@@ -148,11 +149,22 @@ def _auth_gate(request: Request):
         if _path_wants_json(path):
             raise HTTPException(status_code=401, detail="Unauthorized")
         raise HTTPException(status_code=302, headers={"Location": "/login"})
+    # Starlette 1.x re-sends the cookie only when the session changes; re-sign it on
+    # every request so its 24 h max_age measures inactivity, not time since sign-in.
+    request.session.mark_modified()
     # Fresh install: nothing but the forced password change until it's done.
     if change_pending:
         if _path_wants_json(path):
             raise HTTPException(status_code=403, detail="Password change required")
         raise HTTPException(status_code=302, headers={"Location": "/change-password"})
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # An exception in startup() aborts the boot (uvicorn exits non-zero).
+    await startup()
+    yield
+    shutdown()
 
 
 app = FastAPI(
@@ -161,6 +173,7 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,  # served outside the auth gate — it would list every route anonymously
     dependencies=[Depends(_auth_gate)],
+    lifespan=_lifespan,
 )
 # Optional HTTPS (off by default — plain-HTTP LAN use must keep working). With
 # HTTPS_CERT_FILE + HTTPS_KEY_FILE the container serves TLS itself (wired in
@@ -216,9 +229,10 @@ _RESTORE_MAX_BYTES = 2 * 1024 * 1024  # an uploaded backup file
 class _BodySizeLimit:
     """Cap request bodies before anything parses them.
 
-    Starlette 0.49 (the newest FastAPI 0.120 allows) has unauthenticated
-    form-parsing DoS issues reachable via POST /login. Bytes are counted as
-    they stream in, so a chunked body can't sidestep a Content-Length check.
+    Every legitimate body here is tiny, and POST /login parses a form before
+    any login check, so an unauthenticated client must not be able to make the
+    form parser chew through megabytes. Bytes are counted as they stream in,
+    so a chunked body can't sidestep the Content-Length check.
     """
 
     def __init__(self, app):
@@ -303,7 +317,6 @@ def _decrypt_key(stored: str) -> str:
 # Startup / shutdown
 # --------------------------------------------------------------------------- #
 
-@app.on_event("startup")
 async def startup():
     # Validate SECRET_KEY before anything else. It both signs session cookies
     # AND derives the Fernet key that encrypts stored API keys, so a
@@ -403,8 +416,7 @@ async def startup():
         db.close()
 
 
-@app.on_event("shutdown")
-async def shutdown():
+def shutdown():
     from .scheduler import scheduler
 
     if scheduler.running:
@@ -490,7 +502,7 @@ async def health():
 async def login_get(request: Request, db: Session = Depends(get_db)):
     if _logged_in(request, db):
         return RedirectResponse("/", status_code=302)
-    return templates.TemplateResponse("login.html", {"request": request, "error": None})
+    return templates.TemplateResponse(request, "login.html", {"error": None})
 
 
 @app.post("/login")
@@ -504,11 +516,9 @@ async def login_post(
     locked = _login_lock_remaining(ip)
     if locked:
         return templates.TemplateResponse(
+            request,
             "login.html",
-            {
-                "request": request,
-                "error": f"Too many failed attempts. Try again in {locked} seconds.",
-            },
+            {"error": f"Too many failed attempts. Try again in {locked} seconds."},
             status_code=429,
         )
 
@@ -526,7 +536,7 @@ async def login_post(
 
     _record_login_failure(ip)
     return templates.TemplateResponse(
-        "login.html", {"request": request, "error": "Invalid username or password"}
+        request, "login.html", {"error": "Invalid username or password"}
     )
 
 
@@ -549,9 +559,7 @@ async def change_password_get(request: Request, db: Session = Depends(get_db)):
     # password; normal changes go through /settings/password, which checks it.
     if not _password_change_pending(db):
         return RedirectResponse("/settings", status_code=302)
-    return templates.TemplateResponse(
-        "change_password.html", {"request": request, "error": None}
-    )
+    return templates.TemplateResponse(request, "change_password.html", {"error": None})
 
 
 @app.post("/change-password")
@@ -575,9 +583,7 @@ async def change_password_post(
         error = "You cannot reuse the default password. Please choose a unique password."
 
     if error:
-        return templates.TemplateResponse(
-            "change_password.html", {"request": request, "error": error}
-        )
+        return templates.TemplateResponse(request, "change_password.html", {"error": error})
 
     _upsert_setting(db, "admin_password_hash", _hash_password(new_password))
     _upsert_setting(db, "password_changed", "true")
@@ -622,9 +628,9 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
         run._job_name = run.job.name if run.job else "Unknown"
 
     return templates.TemplateResponse(
+        request,
         "dashboard.html",
         {
-            "request": request,
             "job_cards": job_cards,
             "total_jobs": len(jobs),
             "enabled_jobs": sum(1 for j in jobs if j.enabled),
@@ -694,9 +700,9 @@ async def history(request: Request, db: Session = Depends(get_db)):
         run._job_name = name_by_id.get(run.job_id, "Unknown")
 
     return templates.TemplateResponse(
+        request,
         "history.html",
         {
-            "request": request,
             "runs": runs,
             "jobs": jobs,
             "counts": counts,
@@ -731,9 +737,7 @@ async def jobs_list(request: Request, db: Session = Depends(get_db)):
             {"job": job, "last_run": last_run, "next_run": get_next_run_time(job.id)}
         )
 
-    return templates.TemplateResponse(
-        "jobs.html", {"request": request, "job_rows": job_rows}
-    )
+    return templates.TemplateResponse(request, "jobs.html", {"job_rows": job_rows})
 
 
 # --------------------------------------------------------------------------- #
@@ -743,9 +747,9 @@ async def jobs_list(request: Request, db: Session = Depends(get_db)):
 def _job_form(request: Request, job: Optional[SyncJob] = None, error: Optional[str] = None):
     # Never send actual key values to the template — they must not appear in HTML
     return templates.TemplateResponse(
+        request,
         "job_form.html",
         {
-            "request": request,
             "job": job,
             "has_source_key": bool(job and job.source_key),
             "has_dest_key": bool(job and job.dest_key),
@@ -1002,7 +1006,7 @@ async def job_run_now(job_id: int, db: Session = Depends(get_db)):
 
 @app.get("/logs", response_class=HTMLResponse)
 async def logs_page(request: Request):
-    return templates.TemplateResponse("logs.html", {"request": request})
+    return templates.TemplateResponse(request, "logs.html")
 
 
 _LOG_TAIL_BYTES = 256 * 1024  # enough for the last 200 lines without reading the whole log
@@ -1203,9 +1207,9 @@ def download_support_bundle(db: Session = Depends(get_db)):
 async def settings_get(request: Request, db: Session = Depends(get_db)):
     settings = {s.key: s.value for s in db.query(Settings).all()}
     return templates.TemplateResponse(
+        request,
         "settings.html",
         {
-            "request": request,
             "settings": settings,
             "webhook_enabled": (settings.get("webhook_enabled") or "").lower() == "true",
             "webhook_configured": bool(settings.get("webhook_url")),

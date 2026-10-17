@@ -142,6 +142,8 @@ def walkthrough(c: TestClient):
     for path in ("/", "/jobs", "/jobs/new", "/history", "/history?days=0&status=failed",
                  "/logs", "/settings"):
         check(c.get(path).status_code == 200, f"GET {path}")
+    check("session=" in c.get("/jobs").headers.get("set-cookie", ""),
+          "session cookie re-issued on activity (24 h expiry measures inactivity)")
     check(location(c.get("/change-password")) == "/settings", "forced-change form closed afterwards")
 
     print("jobs")

@@ -105,9 +105,10 @@ The gate opens and closes its **own** `SessionLocal()` rather than `Depends(get_
 (fewer while syncs run) would starve every other request (verified 2026-10).
 
 > **⚠️ The gate must read `request.scope["path"]`, never `request.url.path`.** Starlette
-> (≤1.0.0, incl. the pinned 0.49.3) rebuilds `request.url` from the unvalidated `Host`
-> header, so `Host: x/static?` makes any path look public (CVE-2026-48710). Since handlers
-> no longer re-check, a regression here opens every GET route to anonymous users.
+> ≤1.0.0 rebuilt `request.url` from the unvalidated `Host` header, so `Host: x/static?`
+> made any path look public (CVE-2026-48710; fixed in the pinned 1.7.0). Keep
+> `scope["path"]` anyway as defense in depth — handlers no longer re-check, so a gate
+> regression would open every GET route to anonymous users.
 
 Request bodies are capped at 64 KiB by the outermost `_BodySizeLimit` ASGI middleware.
 A declared `Content-Length` over the cap is answered **before the app runs**: plain `413`,
@@ -116,9 +117,10 @@ Content-Length (chunked) are counted as they stream and cut off by an `HTTPExcep
 raised inside `receive` — that surfaces as a 400 on declared-`Form` routes and, because the
 CSRF `BaseHTTPMiddleware` runs `receive` in its own task group, as an uncatchable **500**
 on `/settings/restore` (acceptable: only non-browser clients send chunked bodies, and the
-body is still never parsed). It exists because Starlette 0.49's urlencoded
-form parser ignores `max_fields` (CVE-2026-54283, reachable unauthenticated via
-`POST /login`). The one exception is `/settings/restore` (`_RESTORE_PATH`, 2 MiB), which
+body is still never parsed). It was added when Starlette 0.49's urlencoded form parser
+ignored `max_fields` (CVE-2026-54283, reachable unauthenticated via `POST /login`; fixed in
+Starlette 1.3.1) and stays because `POST /login` parses a form before any credential
+check, so an anonymous client must not be able to feed the parser megabytes. The one exception is `/settings/restore` (`_RESTORE_PATH`, 2 MiB), which
 parses its multipart body **inside the handler** (`request.form()`), so only requests that
 passed the gate are ever parsed — FastAPI parses declared `File()/Form()` params *before*
 running dependencies, which is why that route doesn't declare them.
@@ -422,8 +424,11 @@ if you change the code, keep the claim honest:
   key reaches immich-go via the child env (`IMMICH_GO_UPLOAD_API_KEY`), never argv — so not
   in `ps` / `/proc/<pid>/cmdline` (`/proc/<pid>/environ` is readable only by the same uid
   or root). immich-go output lines are scrubbed of the key before logging.
-- **Sessions** — signed cookie, `max_age=86400`, re-issued on each response (so 24 h of
-  *inactivity*). Cookie is marked `Secure` only when HTTPS is opted into (see **Optional
+- **Sessions** — signed cookie, `max_age=86400`, re-issued on each gated response (so 24 h
+  of *inactivity*, as the README promises). Starlette ≥1.0 only sends the cookie when the
+  session is modified, so `_auth_gate` calls `request.session.mark_modified()` on every
+  authenticated request — without it the 24 h would count from sign-in (smoke test checks
+  the re-issue). Cookie is marked `Secure` only when HTTPS is opted into (see **Optional
   HTTPS** below); by default it isn't, so plain-HTTP LAN use works. **Session epoch revocation:** the cookie carries `epoch`; `_logged_in`
   compares it with the `session_epoch` setting (the gate reads `session_epoch` and `password_changed` per request) and clears
   a stale session. `_bump_session_epoch` runs on both password-change paths and on username
@@ -435,7 +440,7 @@ if you change the code, keep the claim honest:
 - **Login rate limiting** — in-memory per-IP, 10 fails / 15 min → 5-min lockout. Resets
   on restart. `_record_login_failure` sweeps expired entries once per window, so memory is
   bounded. Keyed on `request.client.host`; uvicorn's proxy-headers handling only trusts
-  `X-Forwarded-For` from `FORWARDED_ALLOW_IPS` (default `127.0.0.1`), so behind a reverse
+  `X-Forwarded-For` from `FORWARDED_ALLOW_IPS` (default `127.0.0.1,::1` in uvicorn ≥0.53), so behind a reverse
   proxy all clients share the proxy IP unless the operator sets it. **Documented in the
   README only — no app-level handling.**
 - **CSRF** — `csrf_protect` middleware compares `Origin` (then `Referer`) host to the
@@ -543,6 +548,19 @@ if you change the code, keep the claim honest:
 - ✅ **README said `FORWARDED_ALLOW_IPS=*` was OK when 8080 isn't directly reachable** —
   false: with `*` uvicorn takes the left-most (client-controlled) `X-Forwarded-For` entry.
   README now says never `*`.
+- ✅ **Starlette 0.49.3 CVEs** (CVE-2026-48710 Host-header URL confusion, CVE-2026-54283
+  form `max_fields` ignored, CVE-2026-54282, CVE-2026-48817/48818 StaticFiles) → fastapi
+  0.141.1 + starlette 1.7.0 (+ uvicorn 0.54.0, jinja2 3.1.6). Required converting every
+  `TemplateResponse(name, {"request": …})` to `TemplateResponse(request, name, ctx)`
+  (Starlette 1.0 removed the old form — the old call 500s every page) and moving
+  `@app.on_event` to a `lifespan` (`_lifespan` → `startup()` / `shutdown()`; on_event is
+  deprecated). fastapi 0.141.1 is deliberately the last release **without** the
+  `opentelemetry-api` dependency (0.142+); 0.142.0–0.142.4 also auto-configure OTel
+  exporters from `OTEL_*` env vars — skip those if bumping. Starlette's TestClient warns
+  that plain `httpx` is deprecated in favour of `httpx2` (test-only; harmless).
+  uvicorn 0.54 also parses `X-Forwarded-For` `ip:port` entries to the bare IP and merges
+  repeated XFF lines, and its default `FORWARDED_ALLOW_IPS` is now `127.0.0.1,::1` —
+  the login limiter got harder to dodge; nothing to change (verified 2026-10).
 
 **Owner decisions — by design, don't "fix" (2026-10)**
 - **Default `admin`/`admin` on a fresh install stays.** Requirement instead: nothing but the
@@ -553,12 +571,6 @@ if you change the code, keep the claim honest:
   later re-added is put back into B's album by the pre-check like any new photo.
 
 **Still open — Low / polish**
-- **Starlette 0.49.3 has known CVEs** (CVE-2026-48710 Host-header URL confusion,
-  CVE-2026-54283 form `max_fields` ignored). Both are mitigated in app code (gate on
-  `scope["path"]`; `_BodySizeLimit`), but the real fix is Starlette ≥1.3.1, which needs a
-  newer FastAPI **and** rewriting all 11 `templates.TemplateResponse(name, {"request": …})`
-  calls to the `TemplateResponse(request, name, ctx)` signature Starlette 1.x requires —
-  do it in one change and smoke-test every page.
 - Rate limiter keys on `request.client.host` → one shared bucket (and a lockout DoS lever)
   behind a reverse proxy unless `FORWARDED_ALLOW_IPS` is set. **Documented only** (README);
   no app-level handling.
