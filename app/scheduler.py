@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -109,54 +109,36 @@ def _aps_id(job_id: int) -> str:
     return f"sync_job_{job_id}"
 
 
-def schedule_job(job) -> Optional[datetime]:
+def cron_trigger(expr: str) -> CronTrigger:
+    """UTC trigger for a 5-field cron expression. Raises ValueError if invalid.
+
+    The single parser for schedules, so the job form validates with exactly the
+    rules the scheduler applies. APScheduler 3.x numbers weekdays 0=Monday …
+    6=Sunday (standard cron uses 0=Sunday); names like mon-fri work as expected.
     """
-    Register (or re-register) *job* with APScheduler.
-    Returns the next scheduled run time, or None if job is disabled.
+    return CronTrigger.from_crontab(expr.strip(), timezone="UTC")
+
+
+def schedule_job(job) -> None:
+    """(Re-)register *job* with APScheduler, or unschedule it when disabled.
+
+    Raises ValueError for an invalid cron expression.
     """
     aps_id = _aps_id(job.id)
-
-    # Always remove stale entry first
     if scheduler.get_job(aps_id):
         scheduler.remove_job(aps_id)
-
     if not job.enabled:
-        return None
-
-    try:
-        parts = job.schedule.strip().split()
-        if len(parts) != 5:
-            raise ValueError(f"Expected 5-part cron expression, got: '{job.schedule}'")
-
-        trigger = CronTrigger(
-            minute=parts[0],
-            hour=parts[1],
-            day=parts[2],
-            month=parts[3],
-            day_of_week=parts[4],
-            timezone="UTC",
-        )
-
-        scheduler.add_job(
-            _scheduled_sync_runner,
-            trigger=trigger,
-            args=[job.id],
-            id=aps_id,
-            name=f"Sync: {job.name}",
-            replace_existing=True,
-            misfire_grace_time=3600,  # allow up to 1 h late start
-            coalesce=True,
-        )
-
-        aps_job = scheduler.get_job(aps_id)
-        if aps_job and aps_job.next_run_time:
-            return aps_job.next_run_time
-
-    except Exception as exc:
-        logger.error(f"Failed to schedule job {job.id} ('{job.name}'): {exc}")
-        raise
-
-    return None
+        return
+    scheduler.add_job(
+        _scheduled_sync_runner,
+        trigger=cron_trigger(job.schedule),
+        args=[job.id],
+        id=aps_id,
+        name=f"Sync: {job.name}",
+        replace_existing=True,
+        misfire_grace_time=3600,  # allow up to 1 h late start
+        coalesce=True,
+    )
 
 
 def remove_job(job_id: int):
@@ -176,45 +158,27 @@ def get_next_run_time(job_id: int) -> Optional[datetime]:
 
 
 # --------------------------------------------------------------------------- #
-# Async runner called by APScheduler
+# Run lifecycle — shared by the cron fire and the "Run now" button
 # --------------------------------------------------------------------------- #
 
-async def _scheduled_sync_runner(job_id: int):
-    """APScheduler calls this coroutine at each scheduled time."""
+async def execute_run(job_id: int, run_id: int) -> None:
+    """Run one sync for an already-reserved job and record the outcome.
+
+    The caller must have reserved the job (try_acquire_job) and created the
+    SyncRun row; this is the single place that releases the reservation.
+    """
     from . import notify
     from .database import SessionLocal
     from .models import SyncJob, SyncRun
-    from .sync import release_job, run_sync_job, try_acquire_job
+    from .sync import release_job, run_sync_job
 
     db = SessionLocal()
-    job = None
-    run = None
-    acquired = False
+    job = run = None
     try:
-        job = db.query(SyncJob).filter(
-            SyncJob.id == job_id, SyncJob.enabled == True  # noqa: E712
-        ).first()
-
-        if not job:
-            logger.warning(f"Scheduled job {job_id} not found or disabled — skipping")
-            return
-
-        # Skip this fire if a run (manual or a previous overrun) is still active,
-        # so we never run two syncs of the same job over the shared cache dir.
-        acquired = try_acquire_job(job_id)
-        if not acquired:
-            logger.info(
-                f"Scheduled job {job_id} skipped — a run is already in progress"
-            )
-            return
-
-        logger.info(f"Scheduled run starting for job {job_id} '{job.name}'")
-
-        # Create a SyncRun record
-        run = SyncRun(job_id=job_id, started_at=datetime.utcnow(), status="running")
-        db.add(run)
-        db.commit()
-        db.refresh(run)
+        job = db.query(SyncJob).filter(SyncJob.id == job_id).first()
+        run = db.query(SyncRun).filter(SyncRun.id == run_id).first()
+        if not job or not run:
+            return  # job deleted (its runs cascade) before the task started
 
         await notify.notify(db, job, "start", run=run)
 
@@ -228,25 +192,23 @@ async def _scheduled_sync_runner(job_id: int):
         run.assets_skipped = results["assets_skipped"]
         run.assets_failed = results["assets_failed"]
         run.error_message = results.get("error_message")
-
-        job.last_run_at = datetime.utcnow()
         db.commit()
 
-        logger.info(f"Scheduled job {job_id} finished — status={results['status']}")
-
-        event = notify.STATUS_TO_EVENT.get(results["status"], "success")
+        logger.info(f"Sync job {job_id} finished — status={run.status}")
+        event = notify.STATUS_TO_EVENT.get(run.status, "success")
         await notify.notify(db, job, event, results=results, run=run)
 
     except Exception as exc:
-        logger.error(f"Unhandled error in scheduled job {job_id}: {exc}")
-        if run:
-            run.status = "failed"
-            run.finished_at = datetime.utcnow()
-            run.error_message = str(exc)
-            try:
+        logger.error(f"Unhandled error in sync job {job_id}: {exc}")
+        try:
+            db.rollback()
+            if run:
+                run.status = "failed"
+                run.finished_at = datetime.utcnow()
+                run.error_message = str(exc)
                 db.commit()
-            except Exception:
-                pass
+        except Exception:
+            pass
         if job:
             await notify.notify(
                 db, job, "failed",
@@ -254,6 +216,41 @@ async def _scheduled_sync_runner(job_id: int):
                 run=run,
             )
     finally:
-        if acquired:
-            release_job(job_id)
+        release_job(job_id)
         db.close()
+
+
+async def _scheduled_sync_runner(job_id: int):
+    """APScheduler calls this coroutine at each scheduled time."""
+    from .database import SessionLocal
+    from .models import SyncJob, SyncRun
+    from .sync import release_job, try_acquire_job
+
+    db = SessionLocal()
+    try:
+        job = db.query(SyncJob).filter(
+            SyncJob.id == job_id, SyncJob.enabled == True  # noqa: E712
+        ).first()
+        if not job:
+            logger.warning(f"Scheduled job {job_id} not found or disabled — skipping")
+            return
+
+        # Skip this fire if a run (manual or a previous overrun) is still active,
+        # so we never run two syncs of the same job over the shared cache dir.
+        if not try_acquire_job(job_id):
+            logger.info(f"Scheduled job {job_id} skipped — a run is already in progress")
+            return
+
+        try:
+            run = SyncRun(job_id=job_id, started_at=datetime.utcnow(), status="running")
+            db.add(run)
+            db.commit()
+            run_id = run.id
+        except Exception:
+            release_job(job_id)  # execute_run will never run to release it
+            raise
+    finally:
+        db.close()
+
+    logger.info(f"Scheduled run starting for job {job_id}")
+    await execute_run(job_id, run_id)

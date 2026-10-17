@@ -43,6 +43,14 @@ echo "Setting ownership of /app/appdata to ${PUID}:${PGID}..."
 chown -R "${PUID}:${PGID}" /app/appdata 2>/dev/null \
     || echo "  (could not chown /app/appdata — continuing; check share permissions if writes fail)"
 
+# A CACHE_PATH on its own volume (as the README describes) is usually created
+# root-owned by Docker. Take ownership of the directory itself plus the app's
+# own job_* folders only — never recursively re-own a user's whole share.
+CACHE_DIR="${CACHE_PATH:-/app/appdata/cache}"
+mkdir -p "$CACHE_DIR" 2>/dev/null || true
+chown "${PUID}:${PGID}" "$CACHE_DIR" 2>/dev/null || true
+chown -R "${PUID}:${PGID}" "$CACHE_DIR"/job_* 2>/dev/null || true
+
 echo "Appdata contents:"
 ls -la /app/appdata/ 2>&1 || echo "  (empty or not mounted)"
 echo ""

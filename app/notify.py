@@ -12,8 +12,10 @@ Design rules:
   Only the job name, album names, run counts, status, timestamps, and (for
   failures) the error message are included.
 """
+import ipaddress
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Optional
@@ -24,6 +26,29 @@ import httpx
 from .crypto import decrypt_secret
 
 logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Redaction (shared with the support bundle in main.py)
+# --------------------------------------------------------------------------- #
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_IPV6_CAND_RE = re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])")
+_URL_HOST_RE = re.compile(r"(https?://)([^/\s\"']+)")
+
+
+def _mask_ipv6(m: re.Match) -> str:
+    # The candidate pattern also matches times like 12:34:56 — only mask real IPv6.
+    try:
+        ipaddress.IPv6Address(m.group())
+        return "[redacted-ip]"
+    except ValueError:
+        return m.group()
+
+
+def redact_text(text: str) -> str:
+    """Mask URL hosts and bare IPv4/IPv6 addresses so text can be shared safely."""
+    text = _URL_HOST_RE.sub(lambda m: m.group(1) + "[redacted-host]", text)
+    text = _IPV4_RE.sub("[redacted-ip]", text)
+    return _IPV6_CAND_RE.sub(_mask_ipv6, text)
 
 # Read the same key the rest of the app uses (startup already validated it).
 _SECRET_KEY = os.getenv("SECRET_KEY", "change-me-to-a-unique-random-32-64-char-string")
@@ -102,6 +127,17 @@ def _counts(results: Optional[dict]) -> dict:
     }
 
 
+def _error_text(results: Optional[dict], event: str) -> Optional[str]:
+    """The run's error for failed/partial events, with server hosts/IPs masked.
+
+    Webhooks go to third parties, so internal URLs must never leave in the
+    error string. Callers truncate AFTER this, so a cut can't expose half a host.
+    """
+    if results and results.get("error_message") and event in ("failed", "partial"):
+        return redact_text(str(results["error_message"]))
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Payload builders
 # --------------------------------------------------------------------------- #
@@ -119,13 +155,16 @@ def _generic_payload(event, job, results, run) -> dict:
     }
     if results is not None:
         payload["counts"] = _counts(results)
-        if results.get("error_message") and event in ("failed", "partial"):
-            payload["error"] = str(results["error_message"])
+    error = _error_text(results, event)
+    if error:
+        payload["error"] = error
     if run is not None:
+        # Stored as naive UTC — label them, like "timestamp", so receivers
+        # don't read them as local time.
         if getattr(run, "started_at", None):
-            payload["started_at"] = run.started_at.isoformat()
+            payload["started_at"] = run.started_at.replace(tzinfo=timezone.utc).isoformat()
         if getattr(run, "finished_at", None):
-            payload["finished_at"] = run.finished_at.isoformat()
+            payload["finished_at"] = run.finished_at.replace(tzinfo=timezone.utc).isoformat()
         dur = getattr(run, "duration_seconds", None)
         if dur is not None:
             payload["duration_seconds"] = dur
@@ -150,8 +189,9 @@ def _discord_payload(event, job, results, run) -> dict:
         "footer": {"text": "immich-album-sync"},
         "timestamp": _now_iso(),
     }
-    if results is not None and results.get("error_message") and event in ("failed", "partial"):
-        embed["description"] = "```\n" + str(results["error_message"])[:1000] + "\n```"
+    error = _error_text(results, event)
+    if error:
+        embed["description"] = "```\n" + error[:1000] + "\n```"
     return {"embeds": [embed]}
 
 
@@ -161,8 +201,9 @@ def _slack_payload(event, job, results, run) -> dict:
         c = _counts(results)
         lines.append(f"Uploaded {c['uploaded']} · Skipped {c['skipped']} · Failed {c['failed']}")
     lines.append(f"{job.source_album_name} → {job.dest_album_name}")
-    if results is not None and results.get("error_message") and event in ("failed", "partial"):
-        lines.append("Error: " + str(results["error_message"])[:500])
+    error = _error_text(results, event)
+    if error:
+        lines.append("Error: " + error[:500])
     return {
         "attachments": [
             {

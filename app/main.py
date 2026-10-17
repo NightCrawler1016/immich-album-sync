@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -27,18 +28,24 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
-from .crypto import decrypt_secret as _decrypt_raw, encrypt_secret as _encrypt_raw
-from .database import get_db, init_db
+from .crypto import (
+    decrypt_secret as _decrypt_raw,
+    encrypt_secret as _encrypt_raw,
+    is_encrypted,
+)
+from .database import SessionLocal, get_db, init_db
 from .immich_client import ImmichClient
 from .models import Settings, SyncJob, SyncRun
 from .scheduler import (
+    cron_trigger,
+    execute_run,
     get_next_run_time,
     init_scheduler,
     prune_run_history,
     remove_job,
     schedule_job,
 )
-from .sync import LOG_PATH, release_job, run_sync_job, try_acquire_job
+from .sync import CACHE_BASE, LOG_PATH, release_job, try_acquire_job
 from . import notify
 
 # --------------------------------------------------------------------------- #
@@ -79,12 +86,50 @@ def _path_wants_json(path: str) -> bool:
     )
 
 
+def _get_setting(db: Session, key: str) -> Optional[str]:
+    row = db.query(Settings).filter(Settings.key == key).first()
+    return row.value if row else None
+
+
+def _logged_in(request: Request) -> bool:
+    """True if the session has a user AND was issued in the current session epoch.
+
+    Session cookies are stateless and signed, so a copied cookie can't be
+    revoked individually. Instead every cookie carries the epoch it was issued
+    in; changing the password or username bumps the epoch, which signs out
+    every other session at once.
+    """
+    session = request.session
+    if not session.get("user"):
+        return False
+    db = SessionLocal()
+    try:
+        epoch = _get_setting(db, "session_epoch") or "0"
+    finally:
+        db.close()
+    if session.get("epoch") != epoch:
+        session.clear()
+        return False
+    return True
+
+
+def _bump_session_epoch(db: Session, request: Request) -> None:
+    """Sign out every other session; keep this one signed in."""
+    epoch = str(int(_get_setting(db, "session_epoch") or "0") + 1)
+    _upsert_setting(db, "session_epoch", epoch)
+    request.session["epoch"] = epoch
+
+
 def _auth_gate(request: Request):
-    path = request.url.path
+    # Route handlers rely on this gate and do not re-check the session.
+    # Use the routed path, NOT request.url.path: Starlette rebuilds request.url
+    # from the unvalidated Host header, so "Host: x/static?" would make any
+    # path look public (CVE-2026-48710).
+    path = request.scope["path"]
     if path in _PUBLIC_PATHS or path.startswith("/static"):
         return
     session = request.session
-    if not session.get("user"):
+    if not _logged_in(request):
         if _path_wants_json(path):
             raise HTTPException(status_code=401, detail="Unauthorized")
         raise HTTPException(status_code=302, headers={"Location": "/login"})
@@ -128,7 +173,47 @@ async def csrf_protect(request: Request, call_next):
                 {"error": "CSRF validation failed — request origin missing or mismatched."},
                 status_code=403,
             )
-    return await call_next(request)
+    response = await call_next(request)
+    # Anti-clickjacking: the UI is never meant to be framed. frame-ancestors only —
+    # a fuller CSP would block the Tailwind CDN and the inline template scripts.
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+    return response
+
+
+_MAX_BODY_BYTES = 64 * 1024  # every legitimate request body here is a few KB
+
+
+class _BodySizeLimit:
+    """Cap request bodies before anything parses them.
+
+    Starlette 0.49 (the newest FastAPI 0.120 allows) has unauthenticated
+    form-parsing DoS issues reachable via POST /login. Bytes are counted as
+    they stream in, so a chunked body can't sidestep a Content-Length check.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > _MAX_BODY_BYTES:
+                    raise HTTPException(status_code=413, detail="Request body too large")
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
+# Added last, so it is the outermost layer and wraps every other middleware.
+app.add_middleware(_BodySizeLimit)
 
 # Templates directory is relative to the Python package root
 _template_dir = Path(__file__).parent / "templates"
@@ -143,7 +228,9 @@ app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
 # Jinja2 global helpers
 templates.env.globals["now"] = datetime.utcnow
 templates.env.globals["app_version"] = APP_VERSION
-templates.env.filters["datetimefmt"] = lambda dt, fmt="%Y-%m-%d %H:%M": (
+# Every timestamp shown in the UI is UTC (naive utcnow() / APScheduler UTC) —
+# label it, since sync.log uses the container's local TZ.
+templates.env.filters["datetimefmt"] = lambda dt, fmt="%Y-%m-%d %H:%M UTC": (
     dt.strftime(fmt) if dt else "—"
 )
 
@@ -218,11 +305,33 @@ async def startup():
     # accumulated backlog is trimmed immediately after an upgrade.
     prune_run_history()
 
-    # Re-schedule all enabled jobs that survived a restart
-    from .database import SessionLocal
-
     db = SessionLocal()
     try:
+        # One-time: "Mirror deletes" used to be a no-op checkbox. It now really
+        # removes photos from destination albums (including ones added there
+        # directly), so jobs that ticked it under the old label must opt in again.
+        if _get_setting(db, "mirror_deletes_v2") is None:
+            cleared = (
+                db.query(SyncJob)
+                .filter(SyncJob.delete_sync == True)  # noqa: E712
+                .update({SyncJob.delete_sync: False}, synchronize_session=False)
+            )
+            db.add(Settings(key="mirror_deletes_v2", value="true"))
+            if cleared:
+                logger.warning(
+                    f"Mirror deletes now really removes photos from destination "
+                    f"albums, so it was switched off on {cleared} job(s). Re-enable "
+                    "it per job if you want the destination to match the source."
+                )
+
+        # Encrypt API keys saved in plaintext by builds that predate encryption,
+        # so "encrypted at rest" holds for every install, not just re-saved jobs.
+        for job in db.query(SyncJob).all():
+            for attr in ("source_key", "dest_key"):
+                value = getattr(job, attr)
+                if value and not is_encrypted(value):
+                    setattr(job, attr, _encrypt_key(value))
+
         # Reconcile runs left mid-flight by a previous process. A row can only be
         # "running" if the process that owned it died (restart/crash/OOM) — mark
         # them failed so the UI/history are accurate and the per-job run guard
@@ -235,12 +344,11 @@ async def startup():
         if stale:
             logger.info(f"Startup: marked {len(stale)} interrupted run(s) as failed")
 
+        # Re-schedule all enabled jobs that survived a restart
         jobs = db.query(SyncJob).filter(SyncJob.enabled == True).all()  # noqa: E712
         for job in jobs:
             try:
-                next_run = schedule_job(job)
-                if next_run:
-                    job.next_run_at = next_run
+                schedule_job(job)
             except Exception as exc:
                 logger.error(f"Could not schedule job {job.id}: {exc}")
         db.commit()
@@ -258,10 +366,6 @@ async def shutdown():
 
 
 # --------------------------------------------------------------------------- #
-# Auth helpers
-# --------------------------------------------------------------------------- #
-
-# --------------------------------------------------------------------------- #
 # Login rate limiting (in-memory, per client IP)
 #
 # Slows credential brute-forcing: after too many failures in a window the IP is
@@ -274,6 +378,7 @@ _LOGIN_MAX_FAILS = 10      # failures within the window …
 _LOGIN_WINDOW = 900        # … measured over 15 minutes …
 _LOGIN_LOCKOUT = 300       # … trigger a 5-minute lockout.
 _login_state: dict[str, dict] = {}  # ip -> {"fails", "first", "until"}
+_login_last_sweep = 0.0
 
 
 def _client_ip(request: Request) -> str:
@@ -290,7 +395,17 @@ def _login_lock_remaining(ip: str) -> int:
 
 
 def _record_login_failure(ip: str) -> None:
+    global _login_last_sweep
     now = time.monotonic()
+    # Every window, forget IPs whose window and lockout have both expired, so a
+    # flood from many addresses can't grow this dict without bound.
+    if now - _login_last_sweep > _LOGIN_WINDOW:
+        for old_ip in [
+            k for k, r in _login_state.items()
+            if now - r["first"] > _LOGIN_WINDOW and r["until"] <= now
+        ]:
+            del _login_state[old_ip]
+        _login_last_sweep = now
     rec = _login_state.get(ip)
     if not rec or now - rec["first"] > _LOGIN_WINDOW:
         rec = {"fails": 0, "first": now, "until": 0}
@@ -310,16 +425,6 @@ def _get_admin_creds(db: Session) -> tuple[str, Optional[str]]:
     u = db.query(Settings).filter(Settings.key == "admin_username").first()
     p = db.query(Settings).filter(Settings.key == "admin_password_hash").first()
     return (u.value if u else "admin", p.value if p else None)
-
-
-def _logged_in(request: Request) -> bool:
-    return bool(request.session.get("user"))
-
-
-def _require_login(request: Request):
-    """Raise a redirect if the session has no user."""
-    if not _logged_in(request):
-        raise HTTPException(status_code=302, headers={"Location": "/login"})
 
 
 # --------------------------------------------------------------------------- #
@@ -362,9 +467,13 @@ async def login_post(
         )
 
     admin_username, admin_hash = _get_admin_creds(db)
-    if username == admin_username and admin_hash and _verify_password(password, admin_hash):
+    # Always run bcrypt, so the response time doesn't reveal a correct username.
+    pw_ok = bool(admin_hash) and _verify_password(password, admin_hash)
+    if pw_ok and username == admin_username:
         _record_login_success(ip)
+        request.session.clear()
         request.session["user"] = username
+        request.session["epoch"] = _get_setting(db, "session_epoch") or "0"
         # Check if first-login password change is still required
         pw_row = db.query(Settings).filter(Settings.key == "password_changed").first()
         if pw_row and pw_row.value == "false":
@@ -393,6 +502,10 @@ async def change_password_get(request: Request):
     """Standalone page displayed when the default password has never been changed."""
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    # Only during the forced first-login change — this form skips the current
+    # password; normal changes go through /settings/password, which checks it.
+    if not request.session.get("must_change_password"):
+        return RedirectResponse("/settings", status_code=302)
     return templates.TemplateResponse(
         "change_password.html", {"request": request, "error": None}
     )
@@ -407,6 +520,8 @@ async def change_password_post(
 ):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=302)
+    if not request.session.get("must_change_password"):
+        return RedirectResponse("/settings", status_code=302)
 
     error = None
     if new_password != confirm_password:
@@ -423,6 +538,7 @@ async def change_password_post(
 
     _upsert_setting(db, "admin_password_hash", _hash_password(new_password))
     _upsert_setting(db, "password_changed", "true")
+    _bump_session_epoch(db, request)
     request.session.pop("must_change_password", None)
     logger.info("Admin password changed from default on first login")
     return RedirectResponse("/", status_code=302)
@@ -434,11 +550,6 @@ async def change_password_post(
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
-    if request.session.get("must_change_password"):
-        return RedirectResponse("/change-password", status_code=302)
-
     jobs = db.query(SyncJob).order_by(SyncJob.created_at).all()
 
     job_cards = []
@@ -496,11 +607,6 @@ _RUN_STATUSES = ("success", "partial", "failed", "running")
 
 @app.get("/history", response_class=HTMLResponse)
 async def history(request: Request, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
-    if request.session.get("must_change_password"):
-        return RedirectResponse("/change-password", status_code=302)
-
     qp = request.query_params
     try:
         days = int(qp.get("days", 30))
@@ -570,11 +676,6 @@ async def history(request: Request, db: Session = Depends(get_db)):
 
 @app.get("/jobs", response_class=HTMLResponse)
 async def jobs_list(request: Request, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
-    if request.session.get("must_change_password"):
-        return RedirectResponse("/change-password", status_code=302)
-
     jobs = db.query(SyncJob).order_by(SyncJob.created_at).all()
     job_rows = []
     for job in jobs:
@@ -597,23 +698,58 @@ async def jobs_list(request: Request, db: Session = Depends(get_db)):
 # Jobs — create
 # --------------------------------------------------------------------------- #
 
+def _job_form(request: Request, job: Optional[SyncJob] = None, error: Optional[str] = None):
+    # Never send actual key values to the template — they must not appear in HTML
+    return templates.TemplateResponse(
+        "job_form.html",
+        {
+            "request": request,
+            "job": job,
+            "has_source_key": bool(job and job.source_key),
+            "has_dest_key": bool(job and job.dest_key),
+            "has_job_webhook": bool(job and job.webhook_url),
+            "job_webhook_events": list(notify.parse_events(job.webhook_events)) if job else [],
+            "error": error,
+        },
+        status_code=400 if error else 200,
+    )
+
+
+def _set_job_settings(job: SyncJob, name, source_url, source_album_name, dest_url,
+                      dest_album_name, schedule, delete_sync, cleanup_cache, enabled,
+                      notify_override, webhook_events) -> None:
+    """Copy the submitted non-secret form fields onto *job* (keys are set by the caller)."""
+    job.name = name.strip()
+    job.source_url = source_url.strip().rstrip("/")
+    job.source_album_name = source_album_name.strip()
+    job.dest_url = dest_url.strip().rstrip("/")
+    job.dest_album_name = dest_album_name.strip()
+    job.schedule = schedule.strip()
+    job.delete_sync = delete_sync == "on"
+    job.cleanup_cache = cleanup_cache == "on"
+    job.enabled = enabled == "on"
+    job.notify_override = notify_override.strip() or "inherit"
+    job.webhook_events = notify.events_to_csv(webhook_events or [])
+
+
+_SECRETS_NOT_SAVED = " The API keys / webhook URL you typed were not saved — enter them again."
+
+
+def _job_input_error(schedule: str, webhook_url: str) -> Optional[str]:
+    """Validate a submitted job before anything is saved, so a bad schedule
+    can't be stored and leave the job silently never running."""
+    try:
+        cron_trigger(schedule)
+    except ValueError as exc:
+        return f"Invalid schedule '{schedule.strip()}': {exc}"
+    if webhook_url.strip() and not notify.is_valid_webhook_url(webhook_url.strip()):
+        return "Webhook URL must be an http(s):// address."
+    return None
+
+
 @app.get("/jobs/new", response_class=HTMLResponse)
 async def job_new_get(request: Request):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
-    if request.session.get("must_change_password"):
-        return RedirectResponse("/change-password", status_code=302)
-    return templates.TemplateResponse(
-        "job_form.html", {
-            "request": request,
-            "job": None,
-            "has_source_key": False,
-            "has_dest_key": False,
-            "has_job_webhook": False,
-            "job_webhook_events": [],
-            "error": None,
-        }
-    )
+    return _job_form(request)
 
 
 @app.post("/jobs/new")
@@ -635,37 +771,28 @@ async def job_new_post(
     webhook_events: Optional[list] = Form(None),
     db: Session = Depends(get_db),
 ):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
+    job = SyncJob()
+    _set_job_settings(job, name, source_url, source_album_name, dest_url, dest_album_name,
+                      schedule, delete_sync, cleanup_cache, enabled, notify_override,
+                      webhook_events)
+    error = _job_input_error(schedule, webhook_url)
+    if error:
+        # Re-show what was typed; the unsaved job carries no secrets, so the
+        # API keys must be re-entered (they are never echoed into HTML).
+        return _job_form(request, job, error + _SECRETS_NOT_SAVED)
 
-    job = SyncJob(
-        name=name.strip(),
-        source_url=source_url.strip().rstrip("/"),
-        source_key=_encrypt_key(source_key.strip()),
-        source_album_name=source_album_name.strip(),
-        dest_url=dest_url.strip().rstrip("/"),
-        dest_key=_encrypt_key(dest_key.strip()),
-        dest_album_name=dest_album_name.strip(),
-        schedule=schedule.strip(),
-        delete_sync=delete_sync == "on",
-        cleanup_cache=cleanup_cache == "on",
-        enabled=enabled == "on",
-        notify_override=(notify_override.strip() or "inherit"),
-        webhook_url=_encrypt_key(webhook_url.strip()) if webhook_url.strip() else None,
-        webhook_events=notify.events_to_csv(webhook_events or []),
-    )
+    job.source_key = _encrypt_key(source_key.strip())
+    job.dest_key = _encrypt_key(dest_key.strip())
+    if webhook_url.strip():
+        job.webhook_url = _encrypt_key(webhook_url.strip())
     db.add(job)
     db.commit()
     db.refresh(job)
 
-    if job.enabled:
-        try:
-            next_run = schedule_job(job)
-            if next_run:
-                job.next_run_at = next_run
-                db.commit()
-        except Exception as exc:
-            logger.error(f"Could not schedule new job {job.id}: {exc}")
+    try:
+        schedule_job(job)
+    except Exception as exc:
+        logger.error(f"Could not schedule new job {job.id}: {exc}")
 
     return RedirectResponse("/jobs", status_code=302)
 
@@ -676,25 +803,10 @@ async def job_new_post(
 
 @app.get("/jobs/{job_id}/edit", response_class=HTMLResponse)
 async def job_edit_get(request: Request, job_id: int, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
-    if request.session.get("must_change_password"):
-        return RedirectResponse("/change-password", status_code=302)
     job = db.query(SyncJob).filter(SyncJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # Never send actual key values to the template — they must not appear in HTML
-    return templates.TemplateResponse(
-        "job_form.html", {
-            "request": request,
-            "job": job,
-            "has_source_key": bool(job.source_key),
-            "has_dest_key": bool(job.dest_key),
-            "has_job_webhook": bool(job.webhook_url),
-            "job_webhook_events": list(notify.parse_events(job.webhook_events)),
-            "error": None,
-        }
-    )
+    return _job_form(request, job)
 
 
 @app.post("/jobs/{job_id}/edit")
@@ -717,29 +829,25 @@ async def job_edit_post(
     webhook_events: Optional[list] = Form(None),
     db: Session = Depends(get_db),
 ):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
-
     job = db.query(SyncJob).filter(SyncJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _set_job_settings(job, name, source_url, source_album_name, dest_url, dest_album_name,
+                      schedule, delete_sync, cleanup_cache, enabled, notify_override,
+                      webhook_events)
+    error = _job_input_error(schedule, webhook_url)
+    if error:
+        # Re-show the submitted values. Nothing is committed: the request's
+        # DB session rolls these in-memory changes back when it closes.
+        if source_key.strip() or dest_key.strip() or webhook_url.strip():
+            error += _SECRETS_NOT_SAVED  # else the "stored" badge implies they were kept
+        return _job_form(request, job, error)
 
-    job.name = name.strip()
-    job.source_url = source_url.strip().rstrip("/")
     # Only replace the key if a new value was provided — blank means "keep existing"
     if source_key.strip():
         job.source_key = _encrypt_key(source_key.strip())
-    job.source_album_name = source_album_name.strip()
-    job.dest_url = dest_url.strip().rstrip("/")
     if dest_key.strip():
         job.dest_key = _encrypt_key(dest_key.strip())
-    job.dest_album_name = dest_album_name.strip()
-    job.schedule = schedule.strip()
-    job.delete_sync = delete_sync == "on"
-    job.cleanup_cache = cleanup_cache == "on"
-    job.enabled = enabled == "on"
-    job.notify_override = notify_override.strip() or "inherit"
-    job.webhook_events = notify.events_to_csv(webhook_events or [])
     # Blank webhook URL means "keep existing" (same convention as API keys).
     if webhook_url.strip():
         job.webhook_url = _encrypt_key(webhook_url.strip())
@@ -747,15 +855,10 @@ async def job_edit_post(
 
     db.commit()
 
-    remove_job(job_id)
-    if job.enabled:
-        try:
-            next_run = schedule_job(job)
-            if next_run:
-                job.next_run_at = next_run
-                db.commit()
-        except Exception as exc:
-            logger.error(f"Could not reschedule job {job.id}: {exc}")
+    try:
+        schedule_job(job)
+    except Exception as exc:
+        logger.error(f"Could not reschedule job {job.id}: {exc}")
 
     return RedirectResponse("/jobs", status_code=302)
 
@@ -765,15 +868,28 @@ async def job_edit_post(
 # --------------------------------------------------------------------------- #
 
 @app.post("/jobs/{job_id}/delete")
-async def job_delete(request: Request, job_id: int, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
+async def job_delete(job_id: int, db: Session = Depends(get_db)):
     job = db.query(SyncJob).filter(SyncJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404)
-    remove_job(job_id)
-    db.delete(job)
-    db.commit()
+    # Hold the job's run reservation so a sync can't be mid-upload from the
+    # cache we're about to delete.
+    if not try_acquire_job(job_id):
+        return RedirectResponse(
+            "/jobs?error=A+sync+for+this+job+is+running+-+delete+it+once+the+run+finishes.",
+            status_code=302,
+        )
+    try:
+        remove_job(job_id)
+        db.delete(job)
+        db.commit()
+        # The cache holds this job's private originals; SQLite can hand the same
+        # id to the next new job, so it must not outlive the job.
+        await asyncio.to_thread(
+            shutil.rmtree, Path(CACHE_BASE) / f"job_{job_id}", ignore_errors=True
+        )
+    finally:
+        release_job(job_id)
     return RedirectResponse("/jobs", status_code=302)
 
 
@@ -782,27 +898,20 @@ async def job_delete(request: Request, job_id: int, db: Session = Depends(get_db
 # --------------------------------------------------------------------------- #
 
 @app.post("/jobs/{job_id}/toggle")
-async def job_toggle(request: Request, job_id: int, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+async def job_toggle(job_id: int, db: Session = Depends(get_db)):
     job = db.query(SyncJob).filter(SyncJob.id == job_id).first()
     if not job:
         return JSONResponse({"error": "Not found"}, status_code=404)
 
     job.enabled = not job.enabled
+    try:
+        schedule_job(job)
+    except Exception as exc:
+        # Don't show a job as enabled that can never run (e.g. a schedule
+        # saved before validation existed).
+        db.rollback()
+        return JSONResponse({"error": f"Invalid schedule: {exc}"}, status_code=400)
     db.commit()
-
-    if job.enabled:
-        try:
-            next_run = schedule_job(job)
-            if next_run:
-                job.next_run_at = next_run
-                db.commit()
-        except Exception:
-            pass
-    else:
-        remove_job(job_id)
-
     return JSONResponse({"enabled": job.enabled})
 
 
@@ -810,84 +919,39 @@ async def job_toggle(request: Request, job_id: int, db: Session = Depends(get_db
 # Jobs — run now (AJAX)
 # --------------------------------------------------------------------------- #
 
-@app.post("/jobs/{job_id}/run")
-async def job_run_now(request: Request, job_id: int, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+# The event loop only keeps weak references to tasks; hold "Run now" tasks here
+# so a running sync can't be garbage-collected mid-flight.
+_background_runs: set = set()
 
+
+@app.post("/jobs/{job_id}/run")
+async def job_run_now(job_id: int, db: Session = Depends(get_db)):
     job = db.query(SyncJob).filter(SyncJob.id == job_id).first()
     if not job:
         return JSONResponse({"error": "Job not found"}, status_code=404)
 
     # Refuse to start a second concurrent run of this job (UI double-click, or a
-    # click racing a scheduled fire). Released in _run_background's finally.
+    # click racing a scheduled fire). Released by execute_run when it finishes.
     if not try_acquire_job(job_id):
         return JSONResponse(
             {"error": "A sync for this job is already running."}, status_code=409
         )
 
     # Create run record immediately so the UI can follow it
-    run = SyncRun(job_id=job_id, started_at=datetime.utcnow(), status="running")
-    db.add(run)
-    db.commit()
-    db.refresh(run)
-    run_id = run.id
-
-    asyncio.create_task(_run_background(job_id, run_id))
-
-    return JSONResponse({"status": "started", "run_id": run_id})
-
-
-async def _run_background(job_id: int, run_id: int):
-    from .database import SessionLocal
-
-    db = SessionLocal()
-    job = None
     try:
-        job = db.query(SyncJob).filter(SyncJob.id == job_id).first()
-        if not job:
-            return
-
-        await notify.notify(db, job, "start", run=None)
-
-        results = await run_sync_job(job)
-
-        run = db.query(SyncRun).filter(SyncRun.id == run_id).first()
-        if run:
-            run.finished_at = datetime.utcnow()
-            run.status = results["status"]
-            run.assets_found = results["assets_found"]
-            run.assets_downloaded = results["assets_downloaded"]
-            run.assets_uploaded = results["assets_uploaded"]
-            run.assets_skipped = results["assets_skipped"]
-            run.assets_failed = results["assets_failed"]
-            run.error_message = results.get("error_message")
-
-        job.last_run_at = datetime.utcnow()
+        run = SyncRun(job_id=job_id, started_at=datetime.utcnow(), status="running")
+        db.add(run)
         db.commit()
+        db.refresh(run)
+    except Exception:
+        release_job(job_id)  # execute_run will never run to release it
+        raise
 
-        event = notify.STATUS_TO_EVENT.get(results.get("status", "success"), "success")
-        await notify.notify(db, job, event, results=results, run=run)
-    except Exception as exc:
-        logger.error(f"Background run error (job={job_id}): {exc}")
-        try:
-            run = db.query(SyncRun).filter(SyncRun.id == run_id).first()
-            if run:
-                run.status = "failed"
-                run.finished_at = datetime.utcnow()
-                run.error_message = str(exc)
-                db.commit()
-            if job:
-                await notify.notify(
-                    db, job, "failed",
-                    results={"status": "failed", "error_message": str(exc)},
-                    run=run,
-                )
-        except Exception:
-            pass
-    finally:
-        release_job(job_id)
-        db.close()
+    task = asyncio.create_task(execute_run(job_id, run.id))
+    _background_runs.add(task)
+    task.add_done_callback(_background_runs.discard)
+
+    return JSONResponse({"status": "started", "run_id": run.id})
 
 
 # --------------------------------------------------------------------------- #
@@ -896,47 +960,60 @@ async def _run_background(job_id: int, run_id: int):
 
 @app.get("/logs", response_class=HTMLResponse)
 async def logs_page(request: Request):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
-    if request.session.get("must_change_password"):
-        return RedirectResponse("/change-password", status_code=302)
     return templates.TemplateResponse("logs.html", {"request": request})
+
+
+_LOG_TAIL_BYTES = 256 * 1024  # enough for the last 200 lines without reading the whole log
 
 
 @app.get("/logs/stream")
 async def logs_stream(request: Request):
     """Server-Sent Events stream of the sync log file."""
-    if not _logged_in(request):
-        raise HTTPException(status_code=401)
+
+    def event(line: str) -> str:
+        return f"data: {json.dumps({'line': line})}\n\n"
 
     async def generator():
         log_file = Path(LOG_PATH)
-
-        # Send last 200 lines on connect
-        if log_file.exists():
-            try:
-                with open(log_file, "r", encoding="utf-8", errors="replace") as fh:
-                    lines = fh.readlines()
-                for line in lines[-200:]:
-                    payload = json.dumps({"line": line.rstrip()})
-                    yield f"data: {payload}\n\n"
-            except Exception as exc:
-                yield f"data: {json.dumps({'line': f'[stream] Could not read log: {exc}'})}\n\n"
-
-        # Follow new lines
         try:
-            with open(log_file, "r", encoding="utf-8", errors="replace") as fh:
-                fh.seek(0, 2)  # jump to EOF
-                while True:
-                    if await request.is_disconnected():
-                        break
+            # Create it on a fresh install so the viewer can follow the first
+            # sync instead of erroring and reconnecting in a loop.
+            if not log_file.exists():
+                log_file.parent.mkdir(parents=True, exist_ok=True)
+                log_file.touch()
+
+            # Send the last 200 lines on connect — from the tail only.
+            with open(log_file, "rb") as fb:
+                start = max(0, fb.seek(0, os.SEEK_END) - _LOG_TAIL_BYTES)
+                fb.seek(start)
+                lines = fb.read().decode("utf-8", errors="replace").splitlines()
+            if start:
+                lines = lines[1:]  # first line is probably cut mid-way
+            for line in lines[-200:]:
+                yield event(line)
+
+            # Follow new lines
+            fh = open(log_file, "r", encoding="utf-8", errors="replace")
+            try:
+                fh.seek(0, os.SEEK_END)
+                while not await request.is_disconnected():
                     line = fh.readline()
                     if line:
-                        yield f"data: {json.dumps({'line': line.rstrip()})}\n\n"
-                    else:
-                        await asyncio.sleep(0.4)
+                        yield event(line.rstrip())
+                        continue
+                    await asyncio.sleep(0.4)
+                    # The log rotates at 10 MB: a fresh file is smaller than our
+                    # read position, so reopen it from the start.
+                    try:
+                        if os.stat(log_file).st_size < fh.tell():
+                            fh.close()
+                            fh = open(log_file, "r", encoding="utf-8", errors="replace")
+                    except FileNotFoundError:
+                        pass
+            finally:
+                fh.close()
         except Exception as exc:
-            yield f"data: {json.dumps({'line': f'[stream error] {exc}'})}\n\n"
+            yield event(f"[stream error] {exc}")
 
     return StreamingResponse(
         generator(),
@@ -949,56 +1026,66 @@ async def logs_stream(request: Request):
 # Logs — support bundle download
 # --------------------------------------------------------------------------- #
 
-_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-_URL_HOST_RE = re.compile(r"(https?://)([^/\s\"']+)")
+def _scrub_job_secrets(text: str, jobs: list) -> str:
+    """Remove each job's API keys and bare server hostnames from free text.
 
-
-def _mask_url_host(url: Optional[str]) -> Optional[str]:
-    """Mask the host[:port] of a URL while keeping the scheme (http/https)."""
-    if not url:
-        return url
-    return _URL_HOST_RE.sub(lambda m: m.group(1) + "[redacted-host]", url)
-
-
-def _redact_text(text: str) -> str:
-    """Mask URL hosts and bare IPv4 addresses so a bundle can be shared safely."""
-    text = _URL_HOST_RE.sub(lambda m: m.group(1) + "[redacted-host]", text)
-    text = _IPV4_RE.sub("[redacted-ip]", text)
+    URL hosts and IPs are masked by notify.redact_text; this catches what it
+    can't: the key values themselves and hostnames appearing without a scheme
+    (e.g. in a DNS error). The lookarounds keep a Docker hostname like "immich"
+    from mangling words such as "immich-go".
+    """
+    for job in jobs:
+        for stored in (job.source_key, job.dest_key):
+            key = _decrypt_key(stored) if stored else ""
+            if key:
+                text = text.replace(key, "[redacted-key]")
+        for url in (job.source_url, job.dest_url):
+            host = urlparse(url or "").hostname
+            if host:
+                text = re.sub(
+                    rf"(?<![\w.-]){re.escape(host)}(?![\w-])",
+                    "[redacted-host]", text, flags=re.IGNORECASE,
+                )
     return text
 
 
 @app.get("/logs/support-bundle")
-async def download_support_bundle(request: Request, db: Session = Depends(get_db)):
-    """Build and return a ZIP containing logs, sanitized job configs, run history, and system info."""
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
+def download_support_bundle(db: Session = Depends(get_db)):
+    """Build and return a ZIP containing logs, sanitized job configs, run history, and system info.
+
+    A plain def: FastAPI runs it in the threadpool, keeping the file read,
+    regexes and zip off the event loop.
+    """
+    jobs = db.query(SyncJob).order_by(SyncJob.created_at).all()
+
+    def redact(text: str) -> str:
+        return notify.redact_text(_scrub_job_secrets(text, jobs))
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
 
-        # 1. Sync log file
+        # 1. Sync log file (size-capped by rotation)
         log_file = Path(LOG_PATH)
         if log_file.exists():
             try:
                 raw = log_file.read_text(encoding="utf-8", errors="replace")
-                # Redact server hosts/IPs so the bundle is safe to share
-                zf.writestr("sync.log", _redact_text(raw))
+                # Redact keys, server hosts and IPs so the bundle is safe to share
+                zf.writestr("sync.log", redact(raw))
             except Exception as exc:
                 zf.writestr("sync.log", f"(error reading log: {exc})\n")
         else:
             zf.writestr("sync.log", "(no log file found)\n")
 
         # 2. Job configurations — API keys redacted
-        jobs = db.query(SyncJob).order_by(SyncJob.created_at).all()
         jobs_info = []
         for job in jobs:
             jobs_info.append({
                 "id": job.id,
                 "name": job.name,
-                "source_url": _mask_url_host(job.source_url),
+                "source_url": notify.redact_text(job.source_url or ""),
                 "source_key": "[redacted]",
                 "source_album_name": job.source_album_name,
-                "dest_url": _mask_url_host(job.dest_url),
+                "dest_url": notify.redact_text(job.dest_url or ""),
                 "dest_key": "[redacted]",
                 "dest_album_name": job.dest_album_name,
                 "schedule": job.schedule,
@@ -1030,7 +1117,7 @@ async def download_support_bundle(request: Request, db: Session = Depends(get_db
                 "assets_uploaded": run.assets_uploaded,
                 "assets_skipped": run.assets_skipped,
                 "assets_failed": run.assets_failed,
-                "error_message": run.error_message,
+                "error_message": redact(run.error_message) if run.error_message else None,
             })
         zf.writestr("sync_runs.json", json.dumps(runs_info, indent=2))
 
@@ -1072,10 +1159,6 @@ async def download_support_bundle(request: Request, db: Session = Depends(get_db
 
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_get(request: Request, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
-    if request.session.get("must_change_password"):
-        return RedirectResponse("/change-password", status_code=302)
     settings = {s.key: s.value for s in db.query(Settings).all()}
     return templates.TemplateResponse(
         "settings.html",
@@ -1093,14 +1176,11 @@ async def settings_get(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/settings/webhook")
 async def settings_webhook(
-    request: Request,
     webhook_enabled: Optional[str] = Form(None),
     webhook_url: str = Form(""),
     webhook_events: Optional[list] = Form(None),
     db: Session = Depends(get_db),
 ):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
     url = webhook_url.strip()
     if url and not notify.is_valid_webhook_url(url):
         return RedirectResponse(
@@ -1123,8 +1203,6 @@ async def api_test_webhook(request: Request, db: Session = Depends(get_db)):
     job_id is given and it uses a custom webhook, otherwise the global one —
     so the "leave blank to keep current" fields can still be tested.
     """
-    if not _logged_in(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -1169,10 +1247,12 @@ async def settings_username(
     new_username: str = Form(...),
     db: Session = Depends(get_db),
 ):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
-    _upsert_setting(db, "admin_username", new_username.strip())
-    request.session["user"] = new_username.strip()
+    name = new_username.strip()
+    if not name:  # a blank username can never be typed at login — it locks the admin out
+        return RedirectResponse("/settings?error=Username+cannot+be+blank", status_code=302)
+    _upsert_setting(db, "admin_username", name)
+    request.session["user"] = name
+    _bump_session_epoch(db, request)
     return RedirectResponse("/settings?success=Username+updated", status_code=302)
 
 
@@ -1184,9 +1264,6 @@ async def settings_password(
     confirm_password: str = Form(...),
     db: Session = Depends(get_db),
 ):
-    if not _logged_in(request):
-        return RedirectResponse("/login", status_code=302)
-
     _, admin_hash = _get_admin_creds(db)
     if not admin_hash or not _verify_password(current_password, admin_hash):
         return RedirectResponse("/settings?error=Current+password+incorrect", status_code=302)
@@ -1199,6 +1276,7 @@ async def settings_password(
 
     _upsert_setting(db, "admin_password_hash", _hash_password(new_password))
     _upsert_setting(db, "password_changed", "true")
+    _bump_session_epoch(db, request)
     request.session.pop("must_change_password", None)
     return RedirectResponse("/settings?success=Password+updated+successfully", status_code=302)
 
@@ -1225,9 +1303,6 @@ async def api_test_connection(request: Request, db: Session = Depends(get_db)):
     When api_key is blank and job_id is provided, the stored (encrypted) key
     for that job is used so the form never needs to re-expose the key value.
     """
-    if not _logged_in(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-
     try:
         body = await request.json()
     except Exception:
@@ -1303,10 +1378,7 @@ async def api_test_connection(request: Request, db: Session = Depends(get_db)):
 
 
 @app.get("/api/jobs/{job_id}/status")
-async def api_job_status(request: Request, job_id: int, db: Session = Depends(get_db)):
-    if not _logged_in(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-
+async def api_job_status(job_id: int, db: Session = Depends(get_db)):
     job = db.query(SyncJob).filter(SyncJob.id == job_id).first()
     if not job:
         return JSONResponse({"error": "Not found"}, status_code=404)

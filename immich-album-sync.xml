@@ -31,6 +31,7 @@
     - Webhook notifications on sync start/success/failure (Discord, Slack, or any JSON endpoint)
     - Mobile-responsive design
     - Add-only mode by default (safe for family sharing)
+    - Optional per-job "Mirror deletes" mode keeps the destination album matching the source album (changes album membership only; photos are never deleted from the server)
   </Overview>
   <Category>Backup: MediaApp:Photos Status:Stable</Category>
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>
@@ -86,7 +87,7 @@
     Target="SECRET_KEY"
     Default="change-me-to-a-unique-random-32-64-char-string"
     Mode=""
-    Description="REQUIRED: Change to a unique random string used to sign session cookies and encrypt stored API keys. The container WILL NOT START while this is left at the default/placeholder value (any value starting with 'change-me') or shorter than 16 characters. Key length: minimum 16 characters | recommended 32–64 characters | maximum 128 characters (longer values provide no extra security). Generate a strong key at: https://1password.com/password-generator/ — select 32–64 characters, all character types. WARNING: changing this key after initial setup will invalidate all stored API keys and log out all active sessions — you will need to re-enter API keys for every sync job."
+    Description="REQUIRED: Change to a unique random string used to sign session cookies and encrypt stored API keys. The container WILL NOT START while this is left at the default/placeholder value (any value starting with 'change-me') or shorter than 16 characters. Key length: minimum 16 characters | recommended 32–64 characters | maximum 128 characters (longer values provide no extra security). Generate a strong key at: https://1password.com/password-generator/ — select 32–64 characters, all character types. WARNING: changing this key after initial setup will invalidate all stored API keys and webhook URLs and log out all active sessions — you will need to re-enter API keys for every sync job and any webhook URLs."
     Type="Variable"
     Display="always"
     Required="true"
@@ -97,7 +98,7 @@
     Target="TZ"
     Default="America/New_York"
     Mode=""
-    Description="Container timezone. Used for log timestamps. Examples: America/New_York, America/Chicago, America/Los_Angeles, Europe/London, UTC. Full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones"
+    Description="Container timezone. Used for sync log timestamps only — cron schedules always run in UTC, and the web UI shows times in UTC. Examples: America/New_York, America/Chicago, America/Los_Angeles, Europe/London, UTC. Full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones"
     Type="Variable"
     Display="always"
     Required="false"
@@ -130,7 +131,7 @@
     Target="CLEANUP_CACHE"
     Default="false"
     Mode=""
-    Description="Set to 'true' to automatically delete downloaded originals from the cache directory after they have been successfully uploaded. Saves disk space but files will be re-downloaded on the next sync run. Can also be toggled per-job in the Web UI."
+    Description="Set to 'true' to turn on 'Clean up cache after upload' for every job: downloaded originals are deleted right after a successful upload instead of at the start of the next run. Either way the cache is pruned at the start of every run, and files already on the destination are never re-downloaded. Leave 'false' to choose per job in the Web UI."
     Type="Variable"
     Display="advanced"
     Required="false"
@@ -182,7 +183,7 @@ This lets you route multi-GB or multi-TB downloads to a large array disk or NAS 
     Target="LOG_PATH"
     Default="/app/appdata/logs/sync.log"
     Mode=""
-    Description="Internal path for the sync log file. Viewable live in the Web UI under 'Live Logs'. Leave blank to use the default."
+    Description="Internal path for the sync log file. Viewable live in the Web UI under 'Live Logs'. Rotates at 10 MB, keeping 3 old files (sync.log.1 to sync.log.3). Leave blank to use the default."
     Type="Variable"
     Display="advanced"
     Required="false"
