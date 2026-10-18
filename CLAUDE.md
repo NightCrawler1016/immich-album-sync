@@ -359,8 +359,16 @@ owner tests from their own image tag before the change goes to `dev`.
 ### Release checklist
 
 1. Land changes on `dev`, let `:dev` build, test the dev image.
-2. Merge to `main` (ships `:latest`).
-3. For a versioned release, push a `vX.Y.Z` tag (this is what stamps the human version).
+2. Ship to `main` (`:latest`) by **fast-forwarding** it to `dev` —
+   `git switch main && git merge --ff-only dev && git push origin main`, then switch back to
+   `dev` (the working tree syncs to the owner's other PC). **No merge commits:** `main` and
+   `dev` stay identical, so GitHub never shows `main` as "N commits ahead of dev". Between
+   releases `main` is simply "behind" `dev`, which is expected. (Up to v1.2.0 releases were
+   `--no-ff` "Merge dev: …" commits; on 2026-10-17 `dev` was fast-forwarded onto them once
+   and the owner switched to fast-forward releases.) If `--ff-only` refuses, something was
+   committed straight to `main` — fast-forward `dev` to `main` first, never add a merge commit.
+3. For a versioned release, push a `vX.Y.Z` tag (this is what stamps the human version) —
+   a lightweight tag on the `main` commit: `git tag vX.Y.Z <sha> && git push origin vX.Y.Z`.
 4. If any env var / volume / port / default changed: update **README.md**,
    **docker-compose.yml**, and **immich-album-sync.xml** together — they duplicate the
    same facts and drift is the most common bug here.
