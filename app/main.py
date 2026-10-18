@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from starlette.datastructures import UploadFile
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
 from .crypto import (
@@ -158,6 +159,7 @@ app = FastAPI(
     title="Immich Album Sync",
     docs_url=None,
     redoc_url=None,
+    openapi_url=None,  # served outside the auth gate — it would list every route anonymously
     dependencies=[Depends(_auth_gate)],
 )
 # Optional HTTPS (off by default — plain-HTTP LAN use must keep working). With
@@ -1244,6 +1246,8 @@ async def api_test_webhook(request: Request, db: Session = Depends(get_db)):
     try:
         body = await request.json()
     except Exception:
+        body = None
+    if not isinstance(body, dict):
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
     url = (body.get("url") or "").strip()
@@ -1371,7 +1375,7 @@ async def settings_restore(request: Request, db: Session = Depends(get_db)):
             upload = form.get("backup_file")
             passphrase = form.get("passphrase")
             raw = await upload.read() if isinstance(upload, UploadFile) else b""
-    except HTTPException:  # Starlette's 400 for a malformed multipart body
+    except StarletteHTTPException:  # 400 for a malformed multipart body
         return _settings_redirect("error", "The upload couldn't be read — try again.")
     if not raw:
         return _settings_redirect("error", "Choose a backup file to restore.")
@@ -1479,6 +1483,8 @@ async def api_test_connection(request: Request, db: Session = Depends(get_db)):
     try:
         body = await request.json()
     except Exception:
+        body = None
+    if not isinstance(body, dict):
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
     url = (body.get("url") or "").strip().rstrip("/")

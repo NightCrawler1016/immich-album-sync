@@ -95,7 +95,9 @@ until a forced password change is done. HTML paths get a 302 to `/login` /
 password change is pending). **Route handlers do not
 re-check the session** — don't add per-route checks back, and don't add a new route
 outside the gate without thinking about it. (The two `/change-password` handlers check
-`_logged_in` themselves because that path is in `_PUBLIC_PATHS`.)
+`_logged_in` themselves because that path is in `_PUBLIC_PATHS`.) Routes FastAPI/Starlette
+add on their own (`/openapi.json`, `/docs`, mounts other than `/static`) bypass a
+dependency-based gate entirely — keep `openapi_url`/`docs_url`/`redoc_url` set to `None`.
 
 The gate opens and closes its **own** `SessionLocal()` rather than `Depends(get_db)`: a
 `get_db` session stays checked out until the response finishes, so each open
@@ -530,6 +532,17 @@ if you change the code, keep the claim honest:
 - ✅ **Session cookie never `Secure`** → opt-in Optional HTTPS (native TLS or
   `SESSION_COOKIE_SECURE` for a reverse proxy); plain HTTP stays the default.
 - ✅ **Forced-change flag lived in the session cookie** → read from the DB per request.
+- ✅ **`/openapi.json` was public** (FastAPI serves it as a plain route *outside* the
+  dependency-based gate, so it listed every route anonymously, even before the forced
+  password change) → `openapi_url=None`. `/docs`/`/redoc` were already off. Smoke-tested.
+- ✅ **Restore's malformed-upload handler never fired** — it caught FastAPI's
+  `HTTPException` subclass, but Starlette's form parser raises the base
+  `starlette.exceptions.HTTPException` → now catches `StarletteHTTPException`.
+- ✅ **JSON `[]`/`null` bodies 500'd `/api/test-webhook` and `/api/test-connection`**
+  (`body.get` on a non-dict) → 400.
+- ✅ **README said `FORWARDED_ALLOW_IPS=*` was OK when 8080 isn't directly reachable** —
+  false: with `*` uvicorn takes the left-most (client-controlled) `X-Forwarded-For` entry.
+  README now says never `*`.
 
 **Owner decisions — by design, don't "fix" (2026-10)**
 - **Default `admin`/`admin` on a fresh install stays.** Requirement instead: nothing but the
@@ -550,6 +563,11 @@ if you change the code, keep the claim honest:
   behind a reverse proxy unless `FORWARDED_ALLOW_IPS` is set. **Documented only** (README);
   no app-level handling.
 - `download_original` has no per-asset size ceiling — a hostile source can fill the disk.
+- An open Live Logs tab (`/logs/stream`) holds uvicorn's graceful shutdown at "Waiting for
+  connections to close" until Docker's SIGKILL (~10 s `docker stop`). Harmless; a
+  `--timeout-graceful-shutdown` in entrypoint.sh would shorten it.
+- `/jobs/<int beyond 64-bit>/edit` (and similar) → 500 OverflowError from SQLite. Only
+  reachable by typing a nonsense URL while logged in.
 - `http://` server URLs accepted with no warning → API key sent cleartext. (TLS verify is
   correctly **on** for `https://` — don't add an insecure toggle.)
 - CI actions pinned by mutable tag, not commit SHA.

@@ -106,6 +106,8 @@ def walkthrough(c: TestClient):
     check(location(r) == "/login", "anonymous page request → /login")
     check(r.headers.get("x-frame-options") == "DENY", "anti-framing header set")
     check(c.get("/api/jobs/1/status").status_code == 401, "anonymous API request → 401")
+    check(all(c.get(p).status_code == 404 for p in ("/openapi.json", "/docs", "/redoc")),
+          "no anonymous API schema or docs")
     r = c.get("/jobs", headers={"host": "x/static?"})
     check(location(r) == "/login", "Host-header path confusion doesn't bypass the gate")
 
@@ -158,6 +160,9 @@ def walkthrough(c: TestClient):
     check(c.post(f"/jobs/{job.id}/toggle", headers=ORIGIN).json() == {"enabled": False},
           "toggle pauses the job")
     check(c.get(f"/api/jobs/{job.id}/status").json()["enabled"] is False, "status API")
+    check(all(c.post(p, json=[1], headers=ORIGIN).status_code == 400
+              for p in ("/api/test-webhook", "/api/test-connection")),
+          "non-object JSON bodies get a 400, not a 500")
     r = c.post("/settings/webhook",
                data={"webhook_enabled": "on", "webhook_url": WEBHOOK, "webhook_events": ["failed"]},
                headers=ORIGIN)
@@ -207,6 +212,12 @@ def walkthrough(c: TestClient):
     check("not valid JSON" in location(restore(b"[" * 200_000)), "deeply nested JSON rejected cleanly")
     bad_text = json.dumps({**doc, "jobs": [{**doc["jobs"][0], "name": "\ud800"}]}).encode()
     check("not valid text" in location(restore(bad_text, BACKUP_PASS)), "unencodable text rejected cleanly")
+    r = c.post("/settings/restore", content=b"garbage",
+               headers={**ORIGIN, "Content-Type": "multipart/form-data"})
+    check("couldn't be read" in location(r), "malformed upload redirects with a message")
+    two = [("backup_file", ("a.json", protected, "application/json"))] * 2
+    r = c.post("/settings/restore", headers=ORIGIN, files=two)
+    check("couldn't be read" in location(r), "two-file upload redirects with a message")
     check(len(jobs_in_db()) == 1, "rejected restores changed nothing")
 
     c.post("/jobs/new", data={**JOB_FORM, "name": "Added after the backup"}, headers=ORIGIN)
