@@ -232,8 +232,9 @@ async def run_sync_job(job) -> dict:
     try:
         if not source_api_key or not dest_api_key:
             raise ValueError(
-                "A stored API key could not be decrypted (SECRET_KEY changed?). "
-                "Re-enter the source and destination API keys in the job."
+                "An API key is missing or could not be decrypted (restored from a "
+                "backup without keys, or SECRET_KEY changed?). Re-enter the source "
+                "and destination API keys in the job."
             )
         files_dir.mkdir(parents=True, exist_ok=True)
         source = ImmichClient(job.source_url, source_api_key)

@@ -55,9 +55,11 @@ No client-side build step — templates are shipped as-is.
 
 ```
 app/
-  main.py          # FastAPI app + EVERY route (~1340 lines). Auth gate, CSRF + anti-framing
+  main.py          # FastAPI app + EVERY route (~1560 lines). Auth gate, CSRF + anti-framing
                    # middleware, jobs CRUD, log SSE stream, support bundle, settings,
-                   # test-connection.
+                   # backup/restore routes, test-connection.
+  backup.py        # Config backup file format: export_config() / import_config().
+                   # A PUBLIC, VERSIONED contract — see "Config backup" below.
   sync.py          # run_sync_job(): the whole sync flow + immich-go subprocess wrapper,
                    # per-job run guard, rotating sync.log logger.
   immich_client.py # ImmichClient: async httpx wrapper for the Immich REST API.
@@ -68,14 +70,17 @@ app/
                    # also redact_text() (URL hosts/IPv4/IPv6), shared with the bundle.
   scheduler.py     # APScheduler wrapper: cron_trigger / schedule_job / remove_job,
                    # execute_run (shared run lifecycle), run-history pruning.
-  templates/*.html # base, login, change_password, dashboard, jobs, job_form, logs, settings
+  templates/*.html # base, login, change_password, dashboard, history, jobs, job_form, logs,
+                   # settings. base.html renders the ?success= / ?error= flash on every page.
   static/icon.png  # served unauthenticated at /static (login page needs it)
 Dockerfile         # python:3.12-slim; installs immich-go + gosu; runs entrypoint.sh
 entrypoint.sh      # root → fix ownership → gosu drop to PUID:PGID → uvicorn
 docker-compose.yml # local/example compose
 immich-album-sync.xml  # Unraid Community Applications template
 ca_profile.xml     # Unraid CA profile blurb (Profile/Icon/WebPage)
-.github/workflows/ # docker-dev.yml (dev branch → :dev), docker-main.yml (main/tags → :latest/:x.y.z)
+.github/workflows/ # docker-dev.yml (dev → :dev, test/* → :test-<name>), docker-main.yml
+                   # (main/tags → :latest/:x.y.z). Both run the smoke test first.
+tests/smoke_test.py # end-to-end TestClient walkthrough (no network); `python tests/smoke_test.py`
 requirements.txt   # pinned deps
 ```
 
@@ -83,25 +88,42 @@ requirements.txt   # pinned deps
 
 Auth gate: the app-wide `_auth_gate` dependency (`FastAPI(dependencies=[...])`) is the
 **single** access control. For every path not in `_PUBLIC_PATHS` (`/health`, `/login`,
-`/logout`, `/change-password`) or under `/static`, it requires `_logged_in(request)`
+`/logout`, `/change-password`) or under `/static`, it requires `_logged_in(request, db)`
 (session has `user` **and** its `epoch` matches the `session_epoch` setting) and blocks
 until a forced password change is done. HTML paths get a 302 to `/login` /
 `/change-password`; JSON/API paths (`_path_wants_json`) get `401` (or `403` while a
 password change is pending). **Route handlers do not
 re-check the session** — don't add per-route checks back, and don't add a new route
 outside the gate without thinking about it. (The two `/change-password` handlers check
-`_logged_in` themselves because that path is in `_PUBLIC_PATHS`.)
+`_logged_in` themselves because that path is in `_PUBLIC_PATHS`.) Routes FastAPI/Starlette
+add on their own (`/openapi.json`, `/docs`, mounts other than `/static`) bypass a
+dependency-based gate entirely — keep `openapi_url`/`docs_url`/`redoc_url` set to `None`.
+
+The gate opens and closes its **own** `SessionLocal()` rather than `Depends(get_db)`: a
+`get_db` session stays checked out until the response finishes, so each open
+`/logs/stream` (infinite SSE) would pin one of the 15 pool connections and ~15 log tabs
+(fewer while syncs run) would starve every other request (verified 2026-10).
 
 > **⚠️ The gate must read `request.scope["path"]`, never `request.url.path`.** Starlette
-> (≤1.0.0, incl. the pinned 0.49.3) rebuilds `request.url` from the unvalidated `Host`
-> header, so `Host: x/static?` makes any path look public (CVE-2026-48710). Since handlers
-> no longer re-check, a regression here opens every GET route to anonymous users.
+> ≤1.0.0 rebuilt `request.url` from the unvalidated `Host` header, so `Host: x/static?`
+> made any path look public (CVE-2026-48710; fixed in the pinned 1.7.0). Keep
+> `scope["path"]` anyway as defense in depth — handlers no longer re-check, so a gate
+> regression would open every GET route to anonymous users.
 
-Request bodies are capped at 64 KiB by the outermost `_BodySizeLimit` ASGI middleware
-(counts streamed bytes, so chunked bodies can't bypass it; over-limit → 413). It exists
-because Starlette 0.49's urlencoded form parser ignores `max_fields` (CVE-2026-54283,
-reachable unauthenticated via `POST /login`). Raise the cap if a route ever needs bigger
-bodies.
+Request bodies are capped at 64 KiB by the outermost `_BodySizeLimit` ASGI middleware.
+A declared `Content-Length` over the cap is answered **before the app runs**: plain `413`,
+or for `/settings/restore` a redirect to `/settings?error=…too large…`. Bodies without a
+Content-Length (chunked) are counted as they stream and cut off by an `HTTPException(413)`
+raised inside `receive` — that surfaces as a 400 on declared-`Form` routes and, because the
+CSRF `BaseHTTPMiddleware` runs `receive` in its own task group, as an uncatchable **500**
+on `/settings/restore` (acceptable: only non-browser clients send chunked bodies, and the
+body is still never parsed). It was added when Starlette 0.49's urlencoded form parser
+ignored `max_fields` (CVE-2026-54283, reachable unauthenticated via `POST /login`; fixed in
+Starlette 1.3.1) and stays because `POST /login` parses a form before any credential
+check, so an anonymous client must not be able to feed the parser megabytes. The one exception is `/settings/restore` (`_RESTORE_PATH`, 2 MiB), which
+parses its multipart body **inside the handler** (`request.form()`), so only requests that
+passed the gate are ever parsed — FastAPI parses declared `File()/Form()` params *before*
+running dependencies, which is why that route doesn't declare them.
 
 | Route | Method | Purpose | Auth |
 |---|---|---|---|
@@ -109,7 +131,7 @@ bodies.
 | `/static/*` | GET | App icon/favicon | none (intentional) |
 | `/login` | GET/POST | Login; rate-limited; always runs bcrypt; clears + sets session (with epoch) | public |
 | `/logout` | GET | `session.clear()` | any |
-| `/change-password` | GET/POST | Forced first-login change (no current-pw prompt). Redirects to `/settings` unless `must_change_password` is set | login (own check) |
+| `/change-password` | GET/POST | Forced first-login change (no current-pw prompt). Redirects to `/settings` unless the change is pending (`password_changed == "false"` in the DB) | login (own check) |
 | `/` | GET | Dashboard (10 most-recent runs) | gate |
 | `/history` | GET | Run history: window (`?days=`, default 30, `0`=all) + `?job=`/`?status=` filters, 500-row cap | gate |
 | `/jobs` | GET | Job list | gate |
@@ -125,6 +147,8 @@ bodies.
 | `/settings/username` | POST | Change username (blank rejected); bumps session epoch | gate |
 | `/settings/password` | POST | Change password (verifies current); bumps session epoch | gate |
 | `/settings/webhook` | POST | Save global webhook (blank URL = keep) | gate |
+| `/settings/backup` | POST | Download config backup JSON (optional passphrase; plain `def` → threadpool for the KDF) | gate |
+| `/settings/restore` | POST | Multipart upload; validates all, then replaces every job + webhook settings in one commit; refused while any job is syncing | gate |
 | `/api/test-webhook` | POST | Send a sample notification | gate (401) |
 | `/api/test-connection` | POST | Probe an Immich server + check API-key scopes | gate (401) |
 | `/api/jobs/{id}/status` | GET | Job status JSON | gate (401) |
@@ -159,8 +183,10 @@ bodies.
 
 1. Decrypt both API keys (`decrypt_secret`). Legacy plaintext (not a Fernet token) is
    returned unchanged; a real Fernet token that won't decrypt (SECRET_KEY changed) returns
-   `""`, and the run **fails** immediately with "A stored API key could not be decrypted
-   … Re-enter the source and destination API keys" instead of sending ciphertext to Immich.
+   `""`, and the run **fails** immediately with "An API key is missing or could not be
+   decrypted (restored from a backup without keys, or SECRET_KEY changed?) … Re-enter the
+   source and destination API keys in the job" instead of sending ciphertext to Immich. An
+   empty key from a keyless backup restore takes the same path.
 2. Locate source album by name (case-insensitive), list assets, pair Live Photo `.MOV`
    companions via `livePhotoVideoId`. Listing is version-adaptive: album-detail
    `assets` array on Immich ≤ v2; Immich v3 removed it, so `get_album_assets` falls
@@ -250,6 +276,32 @@ the container's local `TZ`; everything else (UI, schedules) is UTC.
   falls back to the stored per-job/global URL when the field is left blank).
 - `_SECRET_KEY` is read from env at import (same as `sync.py`) to decrypt stored URLs.
 
+### Config backup (`backup.py`) — a public, versioned file format
+
+Users keep these files for years and restore them into newer releases, so treat the
+format like an API (the README documents it):
+
+- `{"format": "immich-album-sync-backup", "format_version": 1, …}`. **Additive** changes
+  (new optional field) keep the version — `import_config` ignores unknown fields and
+  defaults missing ones. A change an older reader would misread **bumps** `FORMAT_VERSION`,
+  and `import_config` must keep reading every older version (convert on load). Files newer
+  than `FORMAT_VERSION` are rejected with an "update the app" message.
+- Field names are semantic (`mirror_deletes`, `source.album`), **not** column names — if you
+  rename a `SyncJob` column, change the mapping in `export_config`/`import_config`, never
+  the file shape. A new `SyncJob` column that is user config belongs in the backup too.
+- Secrets: never plaintext, never `SECRET_KEY` (a backup must survive a rebuild with a new
+  key). Optional passphrase → PBKDF2-HMAC-SHA256 (600k, 16-byte salt) → Fernet; KDF name,
+  iterations and salt live in the file's `encryption` block (iterations capped at 10M on
+  read), plus a `check` token so a wrong passphrase fails before anything is touched. No
+  passphrase → secrets are `null`; restored jobs come back **paused**.
+- Not in a backup: admin credentials, `session_epoch`, run history, cache, env vars.
+- Restore = validate everything (incl. `_job_input_error` per job) → hold every job's run
+  reservation → delete all jobs (runs cascade) → insert → merge webhook settings → one
+  commit → unschedule old ids + rmtree their caches → schedule new jobs → release. Global
+  webhook URL follows the "blank = keep current" convention.
+- `tests/smoke_test.py` round-trips a backup (with and without passphrase, wrong passphrase,
+  newer version, unknown fields) — keep it passing when touching the format.
+
 ---
 
 ## SECRET_KEY (the one env var that matters)
@@ -283,6 +335,11 @@ Image: `ghcr.io/nightcrawler1016/immich-album-sync`.
 | push to `dev` | `docker-dev.yml` | `:dev`, `:dev-<sha>` | `dev-<sha7>` |
 | push to `main` | `docker-main.yml` | `:latest`, `:<sha>` | `main-<sha7>` |
 | tag `vX.Y.Z` | `docker-main.yml` | `:X.Y.Z`, `:X.Y`, `:X`, `:<sha>` | `X.Y.Z` (tag minus `v`) |
+| push to `test/**` | `docker-dev.yml` | `:test-<name>` (`/` → `-`) only — never `:dev` | `test-<name>-<sha7>` |
+
+All three run the `smoke-test` job (`tests/smoke_test.py` on Python 3.12) first; the image
+build `needs:` it. `test/*` branches are for trial changes (e.g. a framework upgrade) the
+owner tests from their own image tag before the change goes to `dev`.
 
 - **App version** is baked at build time: CI passes `--build-arg APP_VERSION=…`, the
   Dockerfile turns it into `ENV APP_VERSION`, and `main.py` reads `os.getenv("APP_VERSION",
@@ -315,15 +372,19 @@ Image: `ghcr.io/nightcrawler1016/immich-album-sync`.
    re-verify that `IMMICH_GO_UPLOAD_API_KEY` is still the env binding for
    `upload --api-key` (otherwise immich-go gets no key and every upload fails).
 7. The Dockerfile runs `python -m compileall -q app && python -c "import app.main"` as a
-   build-time smoke test (the repo has no test suite). A broken import or dependency
-   mismatch fails the image build — read the build log, don't remove the step.
+   build-time check inside the real image (CI also runs `tests/smoke_test.py` before the
+   build). A broken import or dependency mismatch fails the image build — read the build
+   log, don't remove the step.
 
 ### Runtime env vars (keep XML ⇄ code ⇄ README in sync)
 
 `SECRET_KEY` (required), `TZ`, `PUID`/`PGID` (default 99:100), `CLEANUP_CACHE`,
 `CACHE_PATH` (default `/app/appdata/cache`), `BATCH_SIZE_MB` (10240), `BATCH_FILE_COUNT`
 (0), `DB_PATH` (`/app/appdata/config.db`), `LOG_PATH` (`/app/appdata/logs/sync.log`),
-`RUN_HISTORY_RETENTION_DAYS` (90; `0` = forever; in README + XML), `APP_VERSION`
+`RUN_HISTORY_RETENTION_DAYS` (90; `0` = forever; in README + XML), optional
+`HTTPS_CERT_FILE` / `HTTPS_KEY_FILE` / `SESSION_COOKIE_SECURE` (unset/unset/`false`; the two
+file vars are read by both `entrypoint.sh` and `main.py`, `SESSION_COOKIE_SECURE` by `main.py`
+only; in README + XML + compose), `APP_VERSION`
 (build-time). Read in code but **not** documented in README/XML: `DOWNLOAD_TIMEOUT_SECONDS`
 (300, `immich_client.py`) and `WEBHOOK_TIMEOUT_SECONDS` (10, `notify.py`).
 `FORWARDED_ALLOW_IPS` is read by **uvicorn** itself (not app code); it is mentioned only in
@@ -342,9 +403,11 @@ if you change the code, keep the claim honest:
   (`main.py`, wired via `FastAPI(dependencies=[...])`): every non-public route (all
   POST/`/api/*`/`/logs/*` included) requires a session AND blocks until the change is done.
   Default password `admin` is blocked from reuse (min 8 chars). *(Fixed 2026-07 — this used
-  to be enforced only on GET pages, so POST/API routes could bypass it.)* The
-  `/change-password` form (which skips the current-password prompt) only works while
-  `must_change_password` is set; otherwise both GET and POST redirect to `/settings`, where
+  to be enforced only on GET pages, so POST/API routes could bypass it.)* "Pending" is read
+  from the DB (`_password_change_pending` → `password_changed == "false"`) on every request,
+  never cached in the session cookie. Gated JSON routes get `403 Password change required`.
+  The `/change-password` form (which skips the current-password prompt) only works while the
+  change is pending; otherwise both GET and POST redirect to `/settings`, where
   `/settings/password` verifies the current password.
 - **API-key encryption** — Fernet (AES-128-CBC + HMAC), key from SECRET_KEY. Keys are
   never rendered into HTML (forms post blank = "keep existing"; edit shows a "stored"
@@ -355,14 +418,19 @@ if you change the code, keep the claim honest:
   `startup()` re-encrypts any plaintext `source_key`/`dest_key` left by pre-encryption
   builds, so "never stored in plaintext" holds for old installs too.
 - **Key handling at runtime** — keys are decrypted in memory for a sync, a
-  test-connection with a blank key field, and support-bundle scrubbing. The destination
+  test-connection with a blank key field, support-bundle scrubbing, and backup
+  export/restore (`backup.export_config` decrypts every stored secret to re-encrypt it under
+  the passphrase; restore re-encrypts with SECRET_KEY) — the README lists the same. The destination
   key reaches immich-go via the child env (`IMMICH_GO_UPLOAD_API_KEY`), never argv — so not
   in `ps` / `/proc/<pid>/cmdline` (`/proc/<pid>/environ` is readable only by the same uid
   or root). immich-go output lines are scrubbed of the key before logging.
-- **Sessions** — signed cookie, `max_age=86400`, re-issued on each response (so 24 h of
-  *inactivity*). Cookie is **not** marked `Secure` (fine on plain-HTTP LAN; still open,
-  see below). **Session epoch revocation:** the cookie carries `epoch`; `_logged_in`
-  compares it with the `session_epoch` setting (one DB read per gated request) and clears
+- **Sessions** — signed cookie, `max_age=86400`, re-issued on each gated response (so 24 h
+  of *inactivity*, as the README promises). Starlette ≥1.0 only sends the cookie when the
+  session is modified, so `_auth_gate` calls `request.session.mark_modified()` on every
+  authenticated request — without it the 24 h would count from sign-in (smoke test checks
+  the re-issue). Cookie is marked `Secure` only when HTTPS is opted into (see **Optional
+  HTTPS** below); by default it isn't, so plain-HTTP LAN use works. **Session epoch revocation:** the cookie carries `epoch`; `_logged_in`
+  compares it with the `session_epoch` setting (the gate reads `session_epoch` and `password_changed` per request) and clears
   a stale session. `_bump_session_epoch` runs on both password-change paths and on username
   change — every *other* session is signed out, the current one is re-stamped. Login
   clears the session before setting `user`/`epoch`.
@@ -372,7 +440,7 @@ if you change the code, keep the claim honest:
 - **Login rate limiting** — in-memory per-IP, 10 fails / 15 min → 5-min lockout. Resets
   on restart. `_record_login_failure` sweeps expired entries once per window, so memory is
   bounded. Keyed on `request.client.host`; uvicorn's proxy-headers handling only trusts
-  `X-Forwarded-For` from `FORWARDED_ALLOW_IPS` (default `127.0.0.1`), so behind a reverse
+  `X-Forwarded-For` from `FORWARDED_ALLOW_IPS` (default `127.0.0.1,::1` in uvicorn ≥0.53), so behind a reverse
   proxy all clients share the proxy IP unless the operator sets it. **Documented in the
   README only — no app-level handling.**
 - **CSRF** — `csrf_protect` middleware compares `Origin` (then `Referer`) host to the
@@ -398,6 +466,18 @@ if you change the code, keep the claim honest:
   aren't known to the scrubber — acceptable now that the key never reaches the log via argv.
 - **Webhook payloads** — error text goes through `notify.redact_text` (URL hosts/IPs; not
   bare hostnames).
+- **Optional HTTPS** (off by default — the owner runs plain HTTP on a home LAN; keep it
+  that way by default). `HTTPS_CERT_FILE` + `HTTPS_KEY_FILE` (both, or neither):
+  `entrypoint.sh` copies them to `/tmp/tls` owned by PUID:PGID (keys are often root-only
+  0600) and appends `--ssl-certfile/--ssl-keyfile` to uvicorn; an unreadable file exits the
+  container rather than silently serving HTTP. `main.py` sets `NATIVE_HTTPS` from the same
+  two vars and marks the cookie `Secure` (`SessionMiddleware(https_only=…)`).
+  `SESSION_COOKIE_SECURE=true` does the cookie part alone, for TLS terminated at a reverse
+  proxy — over plain http:// it makes login impossible (cookie never sent back), which the
+  README/XML warn about. The HEALTHCHECK tries `http://` then `https://` (`-k`) —
+  that order matters: a TLS probe of the plain-HTTP listener makes uvicorn log "Invalid
+  HTTP request received" every 30 s, while plain HTTP to the TLS listener fails silently. The Unraid
+  `<WebUI>` stays `http://` (it can't be conditional); the XML descriptions say so.
 - **Build supply chain** — Dockerfile verifies immich-go and gosu downloads against pinned
   per-arch SHA-256s (`sha256sum -c`); unknown arch fails the build instead of silently
   installing the amd64 binary.
@@ -454,9 +534,33 @@ if you change the code, keep the claim honest:
   deprecated `asyncio.get_event_loop()`), `_require_login`, `next_run_at`/`last_run_at`
   writes, per-route auth re-checks. "Run now" and cron share `scheduler.execute_run`.
 
-**Still open — Medium (needs a decision — interacts with plain-HTTP LAN use)**
-- **Session cookie not `Secure`** (starlette default `https_only=False`) — add an opt-in
-  `https_only`/`SESSION_COOKIE_SECURE`, gated so plain-HTTP LAN deploys still work.
+- ✅ **Session cookie never `Secure`** → opt-in Optional HTTPS (native TLS or
+  `SESSION_COOKIE_SECURE` for a reverse proxy); plain HTTP stays the default.
+- ✅ **Forced-change flag lived in the session cookie** → read from the DB per request.
+- ✅ **`/openapi.json` was public** (FastAPI serves it as a plain route *outside* the
+  dependency-based gate, so it listed every route anonymously, even before the forced
+  password change) → `openapi_url=None`. `/docs`/`/redoc` were already off. Smoke-tested.
+- ✅ **Restore's malformed-upload handler never fired** — it caught FastAPI's
+  `HTTPException` subclass, but Starlette's form parser raises the base
+  `starlette.exceptions.HTTPException` → now catches `StarletteHTTPException`.
+- ✅ **JSON `[]`/`null` bodies 500'd `/api/test-webhook` and `/api/test-connection`**
+  (`body.get` on a non-dict) → 400.
+- ✅ **README said `FORWARDED_ALLOW_IPS=*` was OK when 8080 isn't directly reachable** —
+  false: with `*` uvicorn takes the left-most (client-controlled) `X-Forwarded-For` entry.
+  README now says never `*`.
+- ✅ **Starlette 0.49.3 CVEs** (CVE-2026-48710 Host-header URL confusion, CVE-2026-54283
+  form `max_fields` ignored, CVE-2026-54282, CVE-2026-48817/48818 StaticFiles) → fastapi
+  0.141.1 + starlette 1.7.0 (+ uvicorn 0.54.0, jinja2 3.1.6). Required converting every
+  `TemplateResponse(name, {"request": …})` to `TemplateResponse(request, name, ctx)`
+  (Starlette 1.0 removed the old form — the old call 500s every page) and moving
+  `@app.on_event` to a `lifespan` (`_lifespan` → `startup()` / `shutdown()`; on_event is
+  deprecated). fastapi 0.141.1 is deliberately the last release **without** the
+  `opentelemetry-api` dependency (0.142+); 0.142.0–0.142.4 also auto-configure OTel
+  exporters from `OTEL_*` env vars — skip those if bumping. Starlette's TestClient warns
+  that plain `httpx` is deprecated in favour of `httpx2` (test-only; harmless).
+  uvicorn 0.54 also parses `X-Forwarded-For` `ip:port` entries to the bare IP and merges
+  repeated XFF lines, and its default `FORWARDED_ALLOW_IPS` is now `127.0.0.1,::1` —
+  the login limiter got harder to dodge; nothing to change (verified 2026-10).
 
 **Owner decisions — by design, don't "fix" (2026-10)**
 - **Default `admin`/`admin` on a fresh install stays.** Requirement instead: nothing but the
@@ -467,21 +571,20 @@ if you change the code, keep the claim honest:
   later re-added is put back into B's album by the pre-check like any new photo.
 
 **Still open — Low / polish**
-- **Starlette 0.49.3 has known CVEs** (CVE-2026-48710 Host-header URL confusion,
-  CVE-2026-54283 form `max_fields` ignored). Both are mitigated in app code (gate on
-  `scope["path"]`; `_BodySizeLimit`), but the real fix is Starlette ≥1.3.1, which needs a
-  newer FastAPI **and** rewriting all 12 `templates.TemplateResponse(name, {"request": …})`
-  calls to the `TemplateResponse(request, name, ctx)` signature Starlette 1.x requires —
-  do it in one change and smoke-test every page.
 - Rate limiter keys on `request.client.host` → one shared bucket (and a lockout DoS lever)
   behind a reverse proxy unless `FORWARDED_ALLOW_IPS` is set. **Documented only** (README);
   no app-level handling.
 - `download_original` has no per-asset size ceiling — a hostile source can fill the disk.
+- An open Live Logs tab (`/logs/stream`) holds uvicorn's graceful shutdown at "Waiting for
+  connections to close" until Docker's SIGKILL (~10 s `docker stop`). Harmless; a
+  `--timeout-graceful-shutdown` in entrypoint.sh would shorten it.
+- `/jobs/<int beyond 64-bit>/edit` (and similar) → 500 OverflowError from SQLite. Only
+  reachable by typing a nonsense URL while logged in.
 - `http://` server URLs accepted with no warning → API key sent cleartext. (TLS verify is
   correctly **on** for `https://` — don't add an insecure toggle.)
 - CI actions pinned by mutable tag, not commit SHA.
-- **Query-string flash reflection** — `/settings?success=…` / `?error=…` text is rendered
-  from the URL (autoescaped, so no XSS, but a crafted link can show arbitrary text in the
+- **Query-string flash reflection** — `?success=…` / `?error=…` text is rendered by
+  `base.html` on every page from the URL (autoescaped, so no XSS, but a crafted link can show arbitrary text in the
   app's UI). Use fixed message codes instead.
 - **Live Photo companion lookups are sequential N+1** (`get_asset_info` per Live Photo in
   `run_sync_job` step 2) — slow on big albums; could be batched/concurrent.
@@ -508,6 +611,20 @@ docker run -p 8080:8080 \
 # → http://localhost:8080  (admin / admin, forced password change)
 ```
 
+**Smoke test** (no Docker needed — this Windows machine has Python 3.14 via `py`, no Docker):
+
+```bash
+py -3.14 -m venv .venv-smoke   # anywhere outside the repo is better (scratchpad)
+.venv-smoke/Scripts/python -m pip install -r requirements.txt   # drop uvicorn[standard] if it won't build
+.venv-smoke/Scripts/python tests/smoke_test.py
+```
+
+CI runs the same script on Python 3.12 before every image build (`smoke-test` job), so a
+failing check blocks `:dev` / `:latest`. It boots the app with `TestClient` against a temp
+DB (env set before `import app.main`), uses one `with TestClient(...)` session for
+everything (APScheduler can't restart on a new loop), and sends `Origin` on every POST
+(CSRF fails closed).
+
 `appdata/`, `*.db`, `*.log`, `cache/` are git-ignored, as are design sources
 (`*.psd`, `screenshots/psd/`, `screenshots/image source files/`).
 
@@ -525,7 +642,9 @@ docker run -p 8080:8080 \
 - **The README is a public security contract.** If you weaken or remove a control, update
   the README claim in the same change.
 - `main.py` is large — read the section you need; it's organized with clear banner
-  comments per area (auth, CSRF, jobs, logs, settings, api).
+  comments per area (auth, CSRF, jobs, logs, settings, backup/restore, api).
+- **Run `tests/smoke_test.py` before pushing**, and extend it when you add a route or a
+  security control.
 
 ## AI Architectural & Pragmatism Rules
 

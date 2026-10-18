@@ -211,4 +211,37 @@ This lets you route multi-GB or multi-TB downloads to a large array disk or NAS 
     Required="false"
     Mask="false">90</Config>
 
+  <Config
+    Name="HTTPS Certificate File (optional)"
+    Target="HTTPS_CERT_FILE"
+    Default=""
+    Mode=""
+    Description="OPTIONAL — leave blank for normal plain-HTTP use on your LAN. Path INSIDE the container to a PEM certificate, e.g. /app/appdata/certs/cert.pem (put the file in your App Data folder under certs/). When this AND 'HTTPS Key File' are both set, port 8080 serves HTTPS only: open https://[IP]:8080 instead of the WebUI link (which stays http://). A self-signed certificate works. See the README section 'Optional HTTPS'."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false"></Config>
+
+  <Config
+    Name="HTTPS Key File (optional)"
+    Target="HTTPS_KEY_FILE"
+    Default=""
+    Mode=""
+    Description="OPTIONAL — leave blank unless you set 'HTTPS Certificate File'. Path INSIDE the container to the matching unencrypted PEM private key, e.g. /app/appdata/certs/key.pem."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false"></Config>
+
+  <Config
+    Name="Secure Session Cookie (reverse proxy)"
+    Target="SESSION_COOKIE_SECURE"
+    Default="false"
+    Mode=""
+    Description="OPTIONAL — only for when an HTTPS reverse proxy (nginx, NPM, SWAG, Traefik…) sits in front of this app. 'true' makes the browser send the login cookie over HTTPS only. Leave 'false' if you open the UI over plain http:// — with 'true' you could never stay logged in. Not needed with the HTTPS Certificate/Key settings above (the cookie is secured automatically)."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false">false</Config>
+
 </Container>
